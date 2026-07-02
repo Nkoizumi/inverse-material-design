@@ -1,0 +1,38 @@
+# Pinned to the versions this repository was developed and validated against.
+# Loosen these (>= instead of ==) if you run into resolver conflicts, but the
+# BoTorch / GPyTorch / pyro-ppl trio is the most likely to need pinning.
+
+# Core scientific stack
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.16.3
+scikit-learn==1.8.0
+
+# Plotting
+matplotlib==3.10.0
+seaborn==0.13.2
+plotly==6.7.0
+
+# Materials-science featurization
+matminer==0.10.1
+pymatgen==2026.3.23
+smact==4.0.0
+
+# Surrogates: exact GP + multi-task GP + BNN
+torch==2.12.1
+gpytorch==1.15.2
+botorch==0.18.1
+pyro-ppl==1.9.1
+
+# XGBoost (optional; used by auto_eda's baseline models)
+xgboost==3.2.0
+
+# Local LLM (optional; step 6 report and auto_eda ensemble)
+ollama==0.6.2
+
+# Report templating
+jinja2==3.1.6
+
+# Web UI
+gradio==6.19.0
+gradio_client==2.5.0

@@ -1,0 +1,73 @@
+Take all the time you need. Here is the data schema to follow:
+
+  Required columns (catalyst mode)
+
+  ┌───────────────────────┬───────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │        Column         │     Type      │                                                                       Notes                                                                       │
+  ├───────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ active_metal          │ str           │ One key from metal_properties.csv's element column (e.g. Pt, Pd, Ru, Ni) OR a mixed/alloy syntax: Pt0.9Sn0.1, Pt+Pd, Pt:0.7+Pd:0.3                │
+  ├───────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ promoter_1            │ str (or       │ Same syntax as active_metal. Empty string = no promoter in this slot                                                                              │
+  │                       │ empty)        │                                                                                                                                                   │
+  ├───────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ promoter_2            │ str (or       │ Same. Can only be non-empty if promoter_1 is non-empty                                                                                            │
+  │                       │ empty)        │                                                                                                                                                   │
+  ├───────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ support               │ str           │ One key from support_properties.csv's support column (e.g. gamma-Al2O3, CeO2, H-ZSM5) OR a mixed-oxide: CeO2+ZrO2, gamma-Al2O3:0.7+SiO2:0.3       │
+  ├───────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ metal_loading_wt      │ float         │ Weight % of active metal                                                                                                                          │
+  ├───────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ promoter_1_loading_wt │ float         │ Weight % of promoter 1 (use 0.0 when promoter is empty)                                                                                           │
+  ├───────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ promoter_2_loading_wt │ float         │ Weight % of promoter 2 (use 0.0 when empty)                                                                                                       │
+  ├───────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ target column(s)      │ float         │ One or two target columns. Their names go into config.TARGET_COLS (currently ["propane_TOF_log", "propane_selectivity"] — rename to whatever you  │
+  │                       │               │ measured)                                                                                                                                         │
+  └───────────────────────┴───────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Optional columns (the pipeline will pick them up automatically if present)
+
+  These match config.OPTIONAL_NUMERIC_FEATURES. Each gets a _present indicator so the surrogate can tell "not measured" from "measured = 0":
+
+  ┌───────────────────────┬─────────────────────────────┐
+  │        Column         │           Meaning           │
+  ├───────────────────────┼─────────────────────────────┤
+  │ metal_dispersion_pct  │ CO chemisorption, %         │
+  ├───────────────────────┼─────────────────────────────┤
+  │ particle_size_nm      │ TEM / XRD avg particle size │
+  ├───────────────────────┼─────────────────────────────┤
+  │ BET_surface_area_m2_g │ BET                         │
+  ├───────────────────────┼─────────────────────────────┤
+  │ pore_volume_cm3_g     │ Pore volume                 │
+  ├───────────────────────┼─────────────────────────────┤
+  │ calcination_temp_C    │ Synthesis condition         │
+  ├───────────────────────┼─────────────────────────────┤
+  │ reduction_temp_C      │ Synthesis condition         │
+  └───────────────────────┴─────────────────────────────┘
+
+  If you also have reaction conditions (T, P, GHSV, H2/HC ratio), the slots are commented out in config.py:OPTIONAL_NUMERIC_FEATURES (line 63-66) — uncomment whichever you have and use the exact
+  column names: reaction_temp_C, reaction_pressure_atm, GHSV_h, H2_HC_ratio.
+
+  Things to know before uploading
+
+  1. Names in the active_metal / promoter / support columns must match the lookup keys exactly (case-sensitive). If you have a metal or oxide we don't have, add a row to the relevant lookup CSV
+  with its physical properties. The pipeline will fail silently (NaN features) for unknown names — easy to miss.
+  2. If you have non-zero promoter loading but the promoter cell is empty, the row will look inconsistent. Either fill the promoter or zero the loading.
+  3. Targets: use whatever your measured outputs are (e.g. propylene_yield_pct, propylene_selectivity_pct, TOF_h-1). For TOF, log-transform if values span > 2 orders of magnitude (the surrogate
+  generalizes better on log scale).
+  4. Row count: anything from 50 rows up works; the parity verdict will tell you honestly whether the surrogate generalizes (the synthetic 72-row run was clearly in the "speculative" regime).
+  5. Two-target vs one-target: pick in the webui tab 1; the pipeline switches between BO (single) and MOBO (dual) automatically.
+  6. First-run sanity check: the webui's tab 2 (Data Exploration → Overview / Missing / Distributions / Outliers / Correlations) is the right place to gut-check the dataset before letting BO
+  touch it.
+
+  Example template
+
+  active_metal,promoter_1,promoter_2,support,metal_loading_wt,promoter_1_loading_wt,promoter_2_loading_wt,BET_surface_area_m2_g,calcination_temp_C,reduction_temp_C,propylene_TOF_log,propylene_se
+  lectivity
+  Pt,Sn,,gamma-Al2O3,1.0,1.0,0.0,180.0,550,500,0.42,0.83
+  Pt,Sn,K,gamma-Al2O3,1.0,1.0,0.5,175.0,550,500,0.51,0.88
+  Pd,In,,CeO2,2.0,0.5,0.0,95.0,500,450,-0.10,0.62
+  ...
+
+  When your CSV is ready, drop it into data/ (or upload via tab 1), and confirm in tab 1's preview that all 8+ columns are detected. If anything fails to parse (unknown support name, missing
+  target, type mismatch), the EDA tab will surface it immediately.

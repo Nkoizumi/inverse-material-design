@@ -1,0 +1,56 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Inverse Material Design"
+abstract: >
+  An end-to-end pipeline for inverse catalyst design: featurization →
+  auto-EDA → GP/BNN surrogate → BO/MOBO → local-LLM scientific report.
+  Includes a Gradio web UI and validated on real PDH catalyst data.
+authors:
+  - family-names: Koizumi
+    given-names: Naoto
+license: Apache-2.0
+type: software
+repository-code: "https://github.com/nkoizumi/inverse-material-design"
+keywords:
+  - catalyst design
+  - inverse design
+  - Bayesian optimization
+  - Gaussian process
+  - matminer
+  - propane dehydrogenation
+
+references:
+  # If you use the ACS PDH dataset with the acs_pdh preset, cite the paper below.
+  # The dataset is NOT open-access and is not bundled with this repository;
+  # see scripts/download_acs_pdh.py for manual-download instructions.
+  - type: article
+    title: >
+      Data-Driven Development of Heterogeneous Catalysts for Propane
+      Dehydrogenation with Machine Learning and Metaheuristic Optimization
+    authors:
+      - family-names: Oh
+        given-names: Jungmok
+      - family-names: Lee
+        given-names: Junho
+      - family-names: Park
+        given-names: Jisu
+      - family-names: Jeon
+        given-names: Namgi
+      - family-names: Na
+        given-names: Gyoung S.
+      - family-names: Chang
+        given-names: Hyunju
+      - family-names: Huh
+        given-names: Joonsuk
+      - family-names: Kim
+        given-names: Hyun Woo
+      - family-names: Yun
+        given-names: Yongju
+    journal: "ACS Materials Letters"
+    volume: 6
+    issue: 11
+    start: 5138
+    end: 5145
+    year: 2024
+    doi: "10.1021/acsmaterialslett.4c01367"
+    url: "https://doi.org/10.1021/acsmaterialslett.4c01367"

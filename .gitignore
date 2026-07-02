@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+.env
+
+# Pipeline outputs (regenerated from scripts)
+checkpoints/
+reports/
+data/*.parquet
+data/eda_results.pkl
+data/eda_summary.json
+
+# Experimental / scratchpad backups (kept locally; not part of the repo)
+data/experiments/
+
+# ACS Materials Letters SI data — must be downloaded by the user, see
+# scripts/download_acs_pdh.py. Copyright / redistribution is the paper's,
+# not this project's.
+data/pdh_ACSMaterialsLetters.csv
+
+# Copyrighted PDH literature PDFs used as local references while curating
+# data/pdh_literature.csv. Do NOT commit — each paper is under the
+# publisher's copyright. Cite via reference_doi in the CSV instead.
+literatures/
+
+# Editor / OS junk
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
