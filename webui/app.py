@@ -75,21 +75,45 @@ def _parse_promoter_selection(selected: list[str]) -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Tab 1 — upload & config
 # ─────────────────────────────────────────────────────────────────────────────
+def _load_csv_failure(message: str):
+    """Failure return for load_csv, in the exact output arity Gradio expects.
+
+    The click handler declares SIX outputs (preview, target_select,
+    load_status, df_state, default_target_state, targets_state). The
+    missing-synthetic-CSV path used to return five, so Gradio raised on arity
+    instead of showing the message the branch was written to display — the
+    error path was itself broken. Building every failure return here keeps the
+    two arities from drifting again.
+    """
+    return (None, gr.update(choices=[], value=[]), message, None, None, [])
+
+
 def load_csv(file_obj, use_synthetic: bool):
     """Read a CSV (uploaded or synthetic). Returns preview + target-column
     choices + status message + the FULL df (for the EDA tab's state) +
-    the default target column name (for the LLM-decisions sub-tab)."""
+    the default target column name (for the LLM-decisions sub-tab) +
+    the initial target selection."""
     if use_synthetic or file_obj is None:
         path = config.DATA_DIR / "synthetic_catalysts.csv"
         if not path.exists():
-            return (None, gr.update(choices=[], value=[]),
-                    "Synthetic CSV not found. Generate it first.",
-                    None, None)
-        df = pd.read_csv(path)
+            return _load_csv_failure(
+                f"Synthetic CSV not found at `{path}`. Generate it with "
+                "`python scripts/generate_synthetic_catalysts.py`, or untick "
+                "the box and upload your own CSV."
+            )
         source = f"synthetic ({path.name})"
     else:
-        df = pd.read_csv(file_obj.name)
-        source = Path(file_obj.name).name
+        path = Path(file_obj.name)
+        source = path.name
+
+    # A malformed or unreadable upload must surface as a message, not as an
+    # unhandled exception inside the Gradio callback.
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        return _load_csv_failure(f"Could not read `{source}` as CSV: {e}")
+    if df.empty or df.shape[1] == 0:
+        return _load_csv_failure(f"`{source}` parsed as an empty table.")
 
     # Auto-derive log-scale versions of wide-dynamic-range targets (e.g.
     # deactivation_rate_h → deactivation_rate_log) so they show up in the
@@ -409,8 +433,13 @@ def candidate_detail(candidates_df: pd.DataFrame, selected_index: int):
     enriched = step6_report._enrich_candidate(row, SUPPORTS_DF, METALS_DF)
 
     parts = [f"### Candidate {int(selected_index) + 1}"]
-    for label, key in [("Composition", "_label"),
-                       ("Active metal", "active_metal"),
+    # The composition line used to read row["_label"], but `_label` is added by
+    # step6's report bundle and is never present in candidates.parquet — so the
+    # line silently never rendered. Build it from the same formatter step6 uses.
+    composition = step6_report._format_catalyst_label(row)
+    if composition:
+        parts.append(f"- **Composition**: {composition}")
+    for label, key in [("Active metal", "active_metal"),
                        ("Promoter 1", "promoter_1"),
                        ("Promoter 2", "promoter_2"),
                        ("Support", "support"),
@@ -435,6 +464,35 @@ def candidate_detail(candidates_df: pd.DataFrame, selected_index: int):
     return "\n".join(parts)
 
 
+def _sort_ascending_for(col: str) -> bool:
+    """Should `col` sort ascending to put the BEST candidates first?
+
+    This tab exists to hand candidates to an experimentalist, so "first row"
+    has to mean "most promising". Sorting every column descending — as this
+    used to — silently put the WORST candidates on top for any minimize
+    target: on the ACS setup, sorting by `pred_deactivation_rate_log`
+    (direction "min") ranked the fastest-deactivating catalysts first.
+
+    Rules:
+      * a prediction column for a "min" target  -> ascending (lower is better)
+      * an uncertainty column (`*_sd`)          -> ascending (tighter is better)
+      * everything else                         -> descending
+    """
+    targets = list(getattr(config, "TARGET_COLS", []))
+    directions = list(getattr(config, "OPTIMIZATION_DIRECTIONS", []))
+    direction_of = dict(zip(targets, directions))
+
+    if col.endswith("_sd"):
+        return True
+
+    # `pred_<target>` from the BO output, or the raw `<target>` column.
+    name = col[len("pred_"):] if col.startswith("pred_") else col
+    # BNN cross-check columns are `pred_<target>_bnn`.
+    if name.endswith("_bnn"):
+        name = name[: -len("_bnn")]
+    return direction_of.get(name, "max") == "min"
+
+
 def filter_candidates(candidates_df, metal_filter, support_filter, sort_col):
     if candidates_df is None or len(candidates_df) == 0:
         return pd.DataFrame()
@@ -446,7 +504,7 @@ def filter_candidates(candidates_df, metal_filter, support_filter, sort_col):
     if support_filter and "support" in out.columns:
         out = out[out["support"].isin(support_filter)]
     if sort_col and sort_col in out.columns:
-        out = out.sort_values(sort_col, ascending=False)
+        out = out.sort_values(sort_col, ascending=_sort_ascending_for(sort_col))
     return out
 
 
@@ -685,7 +743,8 @@ with gr.Blocks(title="Inverse Material Design") as demo:
                 )
                 sort_in = gr.Dropdown(
                     choices=[],
-                    label="Sort by column (descending)",
+                    label=("Sort by column (best first — minimize targets and "
+                           "σ columns sort ascending)"),
                 )
             filter_btn = gr.Button("Apply filters")
             candidate_table = gr.Dataframe(label="Candidates", interactive=False)
