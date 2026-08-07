@@ -301,12 +301,35 @@ def _rank_features_per_role(feature_cols: list[str], score: np.ndarray,
 # Surrogate base class
 # ─────────────────────────────────────────────────────────────────────────────
 class Surrogate(ABC):
+    """Common contract for the surrogates.
+
+    UNCERTAINTY SEMANTICS — every implementation of `predict` must return the
+    PREDICTIVE standard deviation, i.e. including observation noise, not the
+    latent posterior's.
+
+    This matters because the reported sigma is compared across surrogates and
+    bucketed into the report's high/medium/low confidence column. The GP used
+    to return its latent posterior sd (epistemic only) while the BNN sampled
+    its `obs` site and so included noise — roughly a 1.8x difference on the
+    bundled synthetic set, purely definitional, presented side by side as if
+    the two numbers meant the same thing.
+
+    Predictive is the right choice of the two here: the sigma in this report
+    answers "how much should I trust this before spending lab time on it",
+    which is a question about a measurement you have not taken yet. The latent
+    sd would understate that, and understating uncertainty is the worse error
+    when handing candidates to an experimentalist.
+
+    Note this changes reporting only. BO acquisition takes `surrogate.model`
+    directly and never calls `predict`, so candidate selection is unaffected.
+    """
+
     @abstractmethod
     def fit(self, data: XYData) -> None: ...
 
     @abstractmethod
     def predict(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (mean, std) in STANDARDIZED Y space."""
+        """Return (mean, PREDICTIVE std) in STANDARDIZED Y space."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,9 +392,11 @@ class GPSurrogate(Surrogate):
                  self.multi_task, data.X.shape[0], data.Y.shape[1], d)
 
     def predict(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(mean, PREDICTIVE std) — see the Surrogate docstring for why the
+        observation noise is included rather than the latent posterior sd."""
         self.model.eval()
         with torch.no_grad():
-            posterior = self.model.posterior(X)
+            posterior = self.model.posterior(X, observation_noise=True)
             mean = posterior.mean
             std = posterior.variance.clamp_min(1e-12).sqrt()
         # ModelListGP posterior.mean is (N, T); SingleTaskGP is (N, 1). Same shape.
@@ -443,9 +468,11 @@ class SVGPSurrogate(Surrogate):
                 log.info("SVGP SVI step %d  ELBO loss=%.3f", step, loss.item())
 
     def predict(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(mean, PREDICTIVE std) — matches GPSurrogate so the two are
+        interchangeable as the BO driver and comparable in the report."""
         self.model.eval()
         with torch.no_grad():
-            posterior = self.model.posterior(X)
+            posterior = self.model.posterior(X, observation_noise=True)
             mean = posterior.mean
             std = posterior.variance.clamp_min(1e-12).sqrt()
         if mean.ndim == 1:

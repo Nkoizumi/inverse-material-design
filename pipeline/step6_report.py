@@ -90,6 +90,8 @@ These rows are rendered **directly from the BO output**, not via the LLM. Number
 
 The GP drives the BO acquisition. The Bayesian NN is an independent surrogate; agreement between the two strengthens confidence in a candidate.
 
+Both σ are **predictive** standard deviations — they include measurement noise, so they answer "how far off would a lab measurement of this candidate be", not "how uncertain is the model about the latent value". The two columns are therefore directly comparable; a difference between them is genuine model disagreement, not a difference in what σ means.
+
 | # | {{ label_kind }} | {% for t in targets %}GP {{ t }} | BNN {{ t }} | Δ | {% endfor %}
 |---|---|{% for t in targets %}---|---|---|{% endfor %}
 {% for row in candidates %}| {{ loop.index }} | {{ row['_label'] }} | {% for t in targets %}{{ fmt(row.get('pred_' + t)) }} ± {{ fmt(row.get('pred_' + t + '_sd')) }} | {{ fmt(row.get('pred_' + t + '_bnn')) }} ± {{ fmt(row.get('pred_' + t + '_bnn_sd')) }} | {{ fmt_delta(row.get('pred_' + t), row.get('pred_' + t + '_bnn')) }} | {% endfor %}
@@ -244,6 +246,14 @@ def _build_confidence(row: dict, targets: list[str], y_stds: dict[str, float]) -
     Normalizes each target's σ by that target's training-Y std, then averages.
     σ̄/σ_train < 0.5 → high confidence; < 1.0 → medium; otherwise low (the
     surrogate is at or beyond its prior variance).
+
+    The σ fed in here is the PREDICTIVE standard deviation from every
+    surrogate — it includes observation noise (see Surrogate in
+    step4_surrogate). That is what makes the ratio meaningful: σ_train is the
+    spread of measured values, so comparing a predictive σ against it asks
+    "would this prediction be tighter than the data's own scatter?". The GP
+    previously supplied its latent sd here, which understated the ratio by
+    ~1.8x on the bundled synthetic set and was not comparable with the BNN's.
     """
     sigmas_norm: list[float] = []
     for t in targets:
