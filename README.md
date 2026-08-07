@@ -1,5 +1,7 @@
 # Inverse Material Design
 
+[![tests](https://github.com/Nkoizumi/inverse-material-design/actions/workflows/tests.yml/badge.svg)](https://github.com/Nkoizumi/inverse-material-design/actions/workflows/tests.yml)
+
 End-to-end pipeline for inverse catalyst design:
 **CSV → Matminer featurization → auto-EDA → GP/BNN surrogate → BO/MOBO → local-LLM scientific report.**
 
@@ -163,7 +165,16 @@ python -m pytest tests/
 ```
 
 Covers target-twin / preset consistency, `prepare_xy`'s leakage and
-constant-column guards, parity-artifact staleness, and BO reproducibility.
+constant-column guards, parity-artifact staleness, BO reproducibility, the
+featurizers' distinct-value broadcast, and the web UI's schema dispatch and
+candidate sorting.
+
+CI (`.github/workflows/tests.yml`) runs this suite plus the synthetic
+quick-start end to end on every push and pull request, and fails if the BO
+posterior collapses to a single predicted value. The web-UI tests skip
+automatically if `gradio` isn't installed, so the suite still runs on a
+pipeline-only install. The ACS PDH dataset isn't bundled, so the tests that
+need it skip.
 
 ## Layout
 

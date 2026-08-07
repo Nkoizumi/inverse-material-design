@@ -1,0 +1,91 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch supersedes the previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # Gradio phones home on import unless this is set.
+      GRADIO_ANALYTICS_ENABLED: "False"
+      # No display on the runner; matplotlib is pulled in via the report path.
+      MPLBACKEND: Agg
+      # The suite asserts BO reproducibility, so keep hash ordering fixed too.
+      PYTHONHASHSEED: "0"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the version the README's conda instructions install.
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install CPU-only torch
+        # The default PyPI Linux wheel is 532 MB and drags in six nvidia/triton
+        # packages (several GB) that a CPU runner never uses. The +cpu build has
+        # none of them. The pin is READ FROM requirements.txt rather than
+        # duplicated here, so there is one source of truth for the version.
+        run: |
+          set -euo pipefail
+          TORCH_PIN=$(grep -E '^torch==' requirements.txt)
+          echo "Installing $TORCH_PIN from the CPU index"
+          pip install "$TORCH_PIN" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install requirements
+        # Installs the exact file users are told to install, so a broken pin
+        # fails here rather than in someone's first five minutes with the repo.
+        # torch is already satisfied: 2.12.1+cpu matches the ==2.12.1 pin.
+        run: pip install -r requirements.txt
+
+      - name: Report environment
+        run: |
+          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+          python -c "import botorch, gpytorch, pyro, matminer, pymatgen, gradio; print('deps import OK')"
+
+      - name: Run test suite
+        # Several of these guard invariants that fail SILENTLY when broken —
+        # the target-twin leak blocklist, BO reproducibility, the featurizer's
+        # broadcast alignment, and webui schema dispatch. They are the reason
+        # this workflow exists.
+        run: python -m pytest tests/ -q --durations=10
+
+      - name: Run the README quick-start end to end
+        # Unit tests do not exercise step 1 -> 5 as a pipeline. This is the
+        # exact command the README puts in front of a new user; EDA and report
+        # are skipped because both need a local Ollama daemon.
+        run: python run_pipeline.py --preset synthetic_catalyst --skip eda report
+
+      - name: Confirm the quick-start produced candidates
+        run: |
+          python - <<'PY'
+          import pandas as pd, sys
+          from pathlib import Path
+          p = Path("data/candidates.parquet")
+          if not p.exists():
+              sys.exit("step 5 produced no candidates.parquet")
+          df = pd.read_parquet(p)
+          preds = [c for c in df.columns if c.startswith("pred_")]
+          print(f"{len(df)} candidates, prediction columns: {preds}")
+          if df.empty or not preds:
+              sys.exit("candidates.parquet is empty or has no predictions")
+          # A collapsed posterior returns the prior mean for every row; that has
+          # been a real failure mode here, and it does not raise on its own.
+          primary = preds[0]
+          if df[primary].round(9).nunique() == 1:
+              sys.exit(f"all candidates share one predicted {primary} "
+                       f"({df[primary].iloc[0]}) — surrogate posterior collapsed")
+          PY
