@@ -102,13 +102,22 @@ of the source paper — an independent recovery from BO on the same data.
 
 ## Web UI
 
-`python webui/app.py` launches a 5-tab Gradio app. The **synthetic
-catalyst** dataset works through all tabs end-to-end. For the ACS
-atomic-fraction dataset, Tab 5 (Explore) auto-detects the schema and
-renders a sortable candidate table (role-based filters degrade to no-ops),
-and step 6 emits a **minimal report** — the full role-based narrative +
-figures apply to role-based catalysts only. A fraction-mode narrative /
-figure path is on the roadmap.
+`python webui/app.py` launches a 5-tab Gradio app.
+
+The **schema is detected from the uploaded CSV** (role-based / atomic-fraction
+/ single-formula) and drives which featurizer runs; Tab 1 reports what it
+found. Previously the UI always used whatever `CATALYST_MODE` /
+`CATALYST_FRACTION_MODE` happened to be set to in `config.py`, so an
+atomic-fraction upload silently ran through the role-based featurizer.
+
+- **Role-based catalysts** (`synthetic_catalysts.csv`, `pdh_literature.csv`)
+  work through all tabs end-to-end.
+- **Atomic-fraction catalysts** (ACS PDH) now run correctly, with limits Tab 1
+  states up front: Tab 3's library settings don't apply (the BO library is
+  sampled from your data), Tab 5's metal/support filters become no-ops, and
+  step 6 emits a **minimal report** — candidate table plus summary stats, no
+  LLM narrative or figures. A fraction-mode narrative / figure path is on the
+  roadmap.
 
 ## Configuration
 

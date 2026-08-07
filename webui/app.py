@@ -75,6 +75,51 @@ def _parse_promoter_selection(selected: list[str]) -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Tab 1 — upload & config
 # ─────────────────────────────────────────────────────────────────────────────
+def detect_schema(columns) -> str:
+    """Classify a CSV's schema: "role", "fraction" or "single_formula".
+
+    The webui used to read `config.CATALYST_MODE` / `CATALYST_FRACTION_MODE`
+    but never SET them, so whichever values `config.py` happened to hold at
+    import time decided which featurizer ran. Uploading an atomic-fraction CSV
+    therefore went through the role-based featurizer, which skips every missing
+    role column and yields a near-empty feature set — a silently useless run
+    rather than an error. Conversely, editing config.py to run `acs_pdh` from
+    the CLI left the webui stuck in fraction mode.
+
+    Detection mirrors what the featurizers actually require:
+      * role   — has the configured role columns (active_metal, support, …)
+      * fraction — no role columns, but several bare element-symbol columns
+        from CATALYST_FRACTION_ELEMENTS (the ACS PDH set has 20)
+      * single_formula — neither; a `composition`/`formula` column
+    """
+    cols = set(columns)
+    role_cols = set(getattr(config, "CATALYST_ROLES", {}).values())
+    if role_cols and len(role_cols & cols) >= 2:
+        return "role"
+
+    elements = set(getattr(config, "CATALYST_FRACTION_ELEMENTS", []))
+    # 5 is comfortably above what a role-based CSV could hit by accident (an
+    # element-named column like "Al" would have to appear five times over)
+    # and far below the 20 the real fraction datasets carry.
+    if len(elements & cols) >= 5:
+        return "fraction"
+
+    return "single_formula"
+
+
+_SCHEMA_LABEL = {
+    "role": "role-based catalyst (active_metal / promoters / support)",
+    "fraction": "atomic-fraction catalyst (element columns)",
+    "single_formula": "single formula (composition column)",
+}
+
+
+def _apply_schema_mode(schema: str) -> None:
+    """Set the config flags that decide which featurizer step 2 dispatches to."""
+    config.CATALYST_MODE = schema == "role"
+    config.CATALYST_FRACTION_MODE = schema == "fraction"
+
+
 def _load_csv_failure(message: str):
     """Failure return for load_csv, in the exact output arity Gradio expects.
 
@@ -139,10 +184,28 @@ def load_csv(file_obj, use_synthetic: bool):
     if target_default is None and numeric_cols:
         target_default = numeric_cols[0]
 
+    schema = detect_schema(df.columns)
     msg = (
         f"Loaded **{source}** — {len(df)} rows × {df.shape[1]} columns.  \n"
+        f"Detected schema: **{_SCHEMA_LABEL[schema]}**.  \n"
         f"Numeric columns (candidates for targets): {', '.join(numeric_cols) or '*(none)*'}"
     )
+    if schema == "fraction":
+        msg += (
+            "\n\n⚠️ Atomic-fraction mode is partially supported in the UI: "
+            "Tab 3 (Catalyst Library) does not apply — the BO library is "
+            "sampled from your data instead — Tab 5's metal/support filters "
+            "become no-ops, and step 6 emits a **minimal report** (candidate "
+            "table + summary stats, no LLM narrative or figures). The "
+            "surrogate, BO and candidate table all work normally."
+        )
+    elif schema == "single_formula":
+        msg += (
+            "\n\n⚠️ No catalyst role columns and no element-fraction columns "
+            "found. This will run the single-formula (Magpie) path, which has "
+            "no BO library in the UI — use the CLI presets for benchmark "
+            "datasets."
+        )
     initial_targets = numeric_cols[:2]
     return (
         df.head(10),
@@ -218,6 +281,27 @@ def run_pipeline(
         if not target_cols:
             yield log("Pick at least one target column."), None, None, pd.DataFrame()
             return
+
+        # Decide which featurizer step 2 will dispatch to, from the CSV itself.
+        # This has to happen BEFORE step 1: CATALYST_FRACTION_MODE changes what
+        # load_dataset does (it renames the bracketed headers to snake_case and
+        # drops dataset-internal id columns), so detecting after the load would
+        # be too late. Peek at the header only.
+        try:
+            header = pd.read_csv(config.CSV_PATH, nrows=0).columns
+        except Exception as e:
+            yield log(f"Could not read `{config.CSV_PATH}`: {e}"), None, None, pd.DataFrame()
+            return
+        schema = detect_schema(header)
+        _apply_schema_mode(schema)
+        log(f"Schema detected: {_SCHEMA_LABEL[schema]} "
+            f"(CATALYST_MODE={config.CATALYST_MODE}, "
+            f"CATALYST_FRACTION_MODE={config.CATALYST_FRACTION_MODE}).")
+        if schema == "fraction":
+            log("Fraction mode: Tab 3's library settings are ignored (the BO "
+                "library is sampled from your data), and step 6 will emit the "
+                "minimal report.")
+
         config.TARGET_COLS = list(target_cols)
         minimize_set = set(minimize_cols or [])
         config.OPTIMIZATION_DIRECTIONS = [
@@ -261,9 +345,22 @@ def run_pipeline(
         # cap + Pearson-r ranking in step4 already does dimensionality
         # reduction more appropriately for the catalyst case.
         transformer = None
-        if getattr(config, "CATALYST_MODE", False):
+        # Both catalyst schemas skip Tab 2's transform. For role-based mode the
+        # reason is the one below (library rows land out-of-distribution in the
+        # transformed space). For atomic-fraction mode the reason is stronger:
+        # _run_catalyst_fraction_discrete has NO transformer branch at all, so
+        # the surrogate would fit on transformed columns while the BO library
+        # was featurized raw — every library column would miss the training
+        # names, `_align_to_training` would zero-fill the lot, and the GP would
+        # return the prior mean for every candidate. Before schema detection
+        # this was unreachable (CATALYST_MODE was always True in the UI);
+        # enabling fraction mode makes it reachable, hence the explicit gate.
+        if getattr(config, "CATALYST_MODE", False) or getattr(
+            config, "CATALYST_FRACTION_MODE", False
+        ):
             yield log(
-                "Tab 2 transform skipped: CATALYST_MODE on. "
+                "Tab 2 transform skipped: catalyst schema "
+                f"({'role-based' if config.CATALYST_MODE else 'atomic-fraction'}). "
                 "Catalyst BO uses the raw featurized df (step4 caps features "
                 f"at MAX_GP_FEATURES={getattr(config, 'MAX_GP_FEATURES', None)})."
             ), None, None, pd.DataFrame()

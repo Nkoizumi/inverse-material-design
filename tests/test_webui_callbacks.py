@@ -164,6 +164,80 @@ def test_filter_candidates_ignores_unknown_sort_column(acs_directions):
     pd.testing.assert_frame_equal(app.filter_candidates(df, None, None, "nope"), df)
 
 
+# ── W3: schema detection drives the featurizer ───────────────────────────────
+# The webui read CATALYST_MODE / CATALYST_FRACTION_MODE but never set them, so
+# whichever values config.py held at import decided which featurizer ran.
+def test_detects_role_schema():
+    cols = ["active_metal", "promoter_1", "support", "metal_loading_wt", "y"]
+    assert app.detect_schema(cols) == "role"
+
+
+def test_detects_fraction_schema():
+    elements = list(getattr(config, "CATALYST_FRACTION_ELEMENTS", []))[:20]
+    assert app.detect_schema(elements + ["propylene yield"]) == "fraction"
+
+
+def test_detects_single_formula_schema():
+    assert app.detect_schema(["composition", "gap expt"]) == "single_formula"
+
+
+def test_role_schema_wins_over_incidental_element_columns():
+    """A role-based CSV that happens to carry element-named columns must not be
+    mistaken for a fraction table."""
+    cols = ["active_metal", "support", "Al", "Ga", "Mo", "Pt", "Sn", "Zr", "y"]
+    assert app.detect_schema(cols) == "role"
+
+
+def test_a_few_element_columns_do_not_trigger_fraction_mode():
+    assert app.detect_schema(["composition", "Al", "Ga", "y"]) == "single_formula"
+
+
+@pytest.mark.parametrize("filename,expected", [
+    ("synthetic_catalysts.csv", "role"),
+    ("pdh_literature.csv", "role"),
+    ("pdh_ACSMaterialsLetters.csv", "fraction"),
+])
+def test_detects_the_real_bundled_datasets(filename, expected):
+    path = ROOT / "data" / filename
+    if not path.exists():
+        pytest.skip(f"{filename} not present (not bundled / not downloaded)")
+    assert app.detect_schema(pd.read_csv(path, nrows=0).columns) == expected
+
+
+@pytest.mark.parametrize("schema,catalyst,fraction", [
+    ("role", True, False),
+    ("fraction", False, True),
+    ("single_formula", False, False),
+])
+def test_apply_schema_mode_sets_both_flags(schema, catalyst, fraction, monkeypatch):
+    monkeypatch.setattr(config, "CATALYST_MODE", None)
+    monkeypatch.setattr(config, "CATALYST_FRACTION_MODE", None)
+    app._apply_schema_mode(schema)
+    assert config.CATALYST_MODE is catalyst
+    assert config.CATALYST_FRACTION_MODE is fraction
+
+
+def test_fraction_upload_is_flagged_to_the_user(tmp_path):
+    """Fraction mode is only partially supported in the UI; the user must learn
+    that at upload, not by reading a degraded report afterwards."""
+    elements = list(getattr(config, "CATALYST_FRACTION_ELEMENTS", []))[:20]
+    csv = tmp_path / "frac.csv"
+    pd.DataFrame({c: [0.05] for c in elements} | {"y": [1.0]}).to_csv(csv, index=False)
+
+    class _F:
+        name = str(csv)
+
+    msg = app.load_csv(_F(), use_synthetic=False)[2]
+    assert "atomic-fraction" in msg
+    assert "minimal report" in msg
+
+
+def test_role_upload_is_not_flagged():
+    msg = app.load_csv(None, use_synthetic=True)[2]
+    assert "role-based" in msg
+    assert "minimal report" not in msg
+
+
 # ── W6: the composition line that never rendered ─────────────────────────────
 def test_candidate_detail_shows_composition():
     """The bug: this line read row['_label'], which step6 adds to its report
