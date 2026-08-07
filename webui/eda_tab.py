@@ -199,11 +199,18 @@ def render_distributions(df: pd.DataFrame) -> None:
 
     def _on_feature(feat: str):
         series = df[feat].dropna()
+        # Plot the series, not the whole frame. Passing `df` made plotly carry
+        # every other column along for a single-column histogram; it also meant
+        # the histogram silently included the NaNs that `series` drops, so the
+        # box marginal and the Q-Q plot below were computed on a different set
+        # of rows than the bars.
         fig_h = px.histogram(
-            df, x=feat, nbins=40, marginal="box",
+            series, nbins=40, marginal="box",
             title=f"Distribution of {feat}",
+            labels={"value": feat},
             color_discrete_sequence=["#58a6ff"],
         )
+        fig_h.update_layout(showlegend=False, xaxis_title=feat)
         fig_h.update_layout(**THEME, height=420)
 
         try:
@@ -305,16 +312,7 @@ def render_outliers(df: pd.DataFrame) -> None:
         rows = []
         for col in num_cols:
             series = df[col].dropna()
-            if rule == "IQR":
-                q1, q3 = series.quantile(0.25), series.quantile(0.75)
-                iqr = q3 - q1
-                mask = (series < q1 - k * iqr) | (series > q3 + k * iqr)
-            else:
-                mean, std = series.mean(), series.std(ddof=0)
-                if std == 0 or pd.isna(std):
-                    mask = pd.Series(False, index=series.index)
-                else:
-                    mask = (series < mean - k * std) | (series > mean + k * std)
+            mask = outlier_mask(series, rule, k)
             rows.append((col, int(mask.sum()),
                          round(100 * mask.sum() / max(len(series), 1), 2)))
 
@@ -365,6 +363,40 @@ def render_outliers(df: pd.DataFrame) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Sub-tab 5 — Correlations
 # ─────────────────────────────────────────────────────────────────────────────
+def outlier_mask(series: pd.Series, rule: str, k: float) -> pd.Series:
+    """Boolean mask of outliers in `series` under `rule` ("IQR" or "Z-Score").
+
+    Two things this handles that the inline version did not.
+
+    DEGENERATE IQR. When over half a column's values are identical, q1 == q3
+    and the IQR is 0, so `series < q1 | series > q3` flags EVERY value that is
+    not the modal one — a sparse loading column reading as 90% outliers. That
+    is the standard IQR pathology, not information about the data, so a
+    zero-width IQR now reports no outliers. The rule cannot discriminate here;
+    saying so is better than emitting a number that looks like a finding.
+
+    CONSISTENT ddof. The z-score branch used std(ddof=0) while the
+    Distributions tab's Std column uses pandas' default ddof=1, so the two
+    tabs described the same column with different spreads. Immaterial at
+    n > 50, but there is no reason for them to disagree; both are ddof=1 now
+    (the sample estimate, which is what a reader assumes "std" means).
+    """
+    if series.empty:
+        return pd.Series(False, index=series.index, dtype=bool)
+
+    if rule == "IQR":
+        q1, q3 = series.quantile(0.25), series.quantile(0.75)
+        iqr = q3 - q1
+        if pd.isna(iqr) or iqr <= 0:
+            return pd.Series(False, index=series.index, dtype=bool)
+        return (series < q1 - k * iqr) | (series > q3 + k * iqr)
+
+    mean, std = series.mean(), series.std(ddof=1)
+    if pd.isna(std) or std == 0:
+        return pd.Series(False, index=series.index, dtype=bool)
+    return (series < mean - k * std) | (series > mean + k * std)
+
+
 CORRELATION_COLUMN_CAP = 30
 
 

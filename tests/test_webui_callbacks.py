@@ -342,6 +342,48 @@ def test_every_run_pipeline_yield_matches_the_declared_output_count():
     )
 
 
+# ── R3/R4: the outlier rules ─────────────────────────────────────────────────
+def test_degenerate_iqr_reports_no_outliers():
+    """When over half a column's values are identical, q1 == q3 and the IQR is
+    zero, so the inline rule flagged every non-modal value — a sparse loading
+    column read as 10% outliers. That is the rule failing, not a finding."""
+    s = pd.Series([0.0] * 90 + [1.0, 2.0, 3.0, 0.5, 0.7, 1.2, 0.3, 0.9, 1.1, 2.5])
+    assert s.quantile(0.25) == s.quantile(0.75)          # degenerate by construction
+    assert eda_tab.outlier_mask(s, "IQR", 1.5).sum() == 0
+
+
+def test_iqr_still_flags_real_outliers():
+    """The degenerate guard must not disarm the rule on well-spread data."""
+    rng = np.random.default_rng(0)
+    s = pd.Series(list(rng.normal(size=200)) + [50.0, -50.0])
+    flagged = eda_tab.outlier_mask(s, "IQR", 1.5)
+    assert flagged.sum() >= 2
+    assert flagged.iloc[-1] and flagged.iloc[-2]         # the injected extremes
+
+
+def test_zscore_uses_the_same_ddof_as_the_distributions_tab():
+    """The two tabs described the same column with different spreads: the
+    z-score rule used ddof=0, the Std column pandas' default ddof=1."""
+    rng = np.random.default_rng(1)
+    s = pd.Series(rng.normal(size=60))
+    # k chosen so the ddof choice changes which points fall outside.
+    strict = eda_tab.outlier_mask(s, "Z-Score", 2.0)
+    expected = (s < s.mean() - 2.0 * s.std(ddof=1)) | (s > s.mean() + 2.0 * s.std(ddof=1))
+    pd.testing.assert_series_equal(strict, expected, check_names=False)
+
+
+def test_zero_variance_column_reports_no_outliers():
+    s = pd.Series([3.0] * 40)
+    assert eda_tab.outlier_mask(s, "Z-Score", 2.0).sum() == 0
+    assert eda_tab.outlier_mask(s, "IQR", 1.5).sum() == 0
+
+
+def test_empty_series_is_handled():
+    s = pd.Series([], dtype=float)
+    for rule in ("IQR", "Z-Score"):
+        assert eda_tab.outlier_mask(s, rule, 1.5).sum() == 0
+
+
 # ── R1: the correlation heatmap's column cap ─────────────────────────────────
 def test_no_cap_note_when_everything_fits():
     df = pd.DataFrame({f"c{i}": [1.0, 2.0, 3.0] for i in range(5)})
