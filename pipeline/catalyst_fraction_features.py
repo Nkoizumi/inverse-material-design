@@ -42,7 +42,11 @@ from catalyst_features import LookupIndex, weighted_lookup
 
 log = logging.getLogger(__name__)
 
-_MIN_SUPPORT_FRACTION = 0.30   # below this, we don't assign a support
+# Below this, a row is treated as having no support at all. Public because
+# step6_report reconstructs the same support assignment when it writes the
+# fraction-mode narrative — a report that named a support the featurizer
+# never assigned would quote support_phys_* numbers the surrogate never saw.
+MIN_SUPPORT_FRACTION = 0.30
 
 
 def featurize_fractions(df: pd.DataFrame, *,
@@ -81,11 +85,11 @@ def featurize_fractions(df: pd.DataFrame, *,
         out[sup_fraction_col] = cation_block.max(axis=1)
         out[sup_cation_col] = cation_block.idxmax(axis=1)
         # Below the cutoff (e.g. metal-rich rows with no oxide), null it out.
-        mask = out[sup_fraction_col] < _MIN_SUPPORT_FRACTION
+        mask = out[sup_fraction_col] < MIN_SUPPORT_FRACTION
         if mask.any():
             log.info("  %d/%d rows have no dominant support cation "
                      "(max support fraction < %.2f).",
-                     int(mask.sum()), len(out), _MIN_SUPPORT_FRACTION)
+                     int(mask.sum()), len(out), MIN_SUPPORT_FRACTION)
             out.loc[mask, sup_cation_col] = pd.NA
     out[sup_oxide_col] = out[sup_cation_col].map(
         support_oxide_map, na_action="ignore"

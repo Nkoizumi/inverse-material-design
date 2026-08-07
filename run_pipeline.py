@@ -63,9 +63,10 @@ PRESETS = {
     # Targets: maximize propylene yield, minimize deactivation rate (log).
     # Signal expectations (from honest 5-fold CV, 2026-06-24 baseline):
     #   GP yield R²≈+0.53   GP deact_log R²≈+0.25
-    # Webui does NOT work in fraction mode yet (Tab 4 KeyError, Step 6 report
-    # writer expects role-shape candidates). CLI only. Run with:
-    #   python run_pipeline.py --preset acs_pdh --skip eda report
+    # Runs end-to-end in both the CLI and the webui. Step 6 reconstructs the
+    # support / metal-phase split for this schema; Tab 3 and Tab 5's role
+    # filters are the parts that still do not apply (see README).
+    #   python run_pipeline.py --preset acs_pdh
     "acs_pdh": {
         "DATASET_SOURCE": "csv",
         "CSV_PATH": Path(__file__).parent / "data" / "pdh_ACSMaterialsLetters.csv",

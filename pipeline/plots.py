@@ -1,6 +1,6 @@
 """Plot generation for the report.
 
-Four figures are produced (dual-target catalyst mode):
+Five figures are produced (dual-target catalyst mode):
 
   1. Pareto frontier — training data + BO candidate predictions with σ.
   2. Feature importance bars — top held-out permutation features per target.
@@ -9,6 +9,9 @@ Four figures are produced (dual-target catalyst mode):
   4. Candidate property heatmap — rows = top candidates, cols = key
      catalyst features, color = candidate's value normalised across the
      candidate set (column min-max → 0..1).
+  5. Metal-phase composition heatmap — atomic-fraction schema only; rows =
+     top candidates, cols = non-support elements, color = atomic fraction on
+     a single shared scale.
 
 Each function returns the path on success or None if the figure can't be drawn.
 """
@@ -388,6 +391,105 @@ def make_candidate_heatmap(
 
     ax.set_title("Candidate properties (color = normalised across the candidate set)")
     fig.colorbar(im, ax=ax, label="min-max within column")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Metal-phase composition heatmap (atomic-fraction schema only)
+# ─────────────────────────────────────────────────────────────────────────────
+def build_fraction_composition_matrix(
+    enriched_candidates: list[dict],
+    element_cols: list[str],
+    support_cations: list[str],
+) -> tuple[list[str], list[str], np.ndarray] | None:
+    """(row_labels, element_labels, matrix) of metal-phase atomic fractions.
+
+    Columns are every non-support panel element that at least one candidate
+    carries at all — no minimum-fraction cutoff, because a PDH noble metal
+    sits near 1e-3 and a "tidy" threshold would hide it. The support cation
+    IS excluded: it is ~0.95 in every row and would flatten the shared colour
+    scale to nothing. It is named in each row label instead.
+
+    Shared by the PNG and the Plotly renderer so the two can never disagree
+    about which elements were worth drawing. Returns None when no candidate
+    carries any metal (pure-support batch).
+    """
+    if not enriched_candidates:
+        return None
+    supports = set(support_cations or [])
+    metals = [e for e in (element_cols or []) if e not in supports]
+
+    def _frac(cand: dict, el: str) -> float:
+        v = cand.get(el)
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        return 0.0 if np.isnan(f) else f
+
+    keep = [e for e in metals
+            if any(_frac(c, e) > 0 for c in enriched_candidates)]
+    if not keep:
+        return None
+
+    matrix = np.array([[_frac(c, e) for e in keep] for c in enriched_candidates],
+                      dtype=float)
+    # Row labels name the SUPPORT, not the full composition: the metal
+    # fractions are what the cells already show, and repeating them in the
+    # label squeezes the plot area to nothing on a 6-element panel.
+    row_labels = []
+    for i, c in enumerate(enriched_candidates):
+        support = c.get("support")
+        if support:
+            cation, frac = c.get("support_cation"), c.get("support_fraction")
+            tail = (f"{support} ({cation} {frac:.2f})"
+                    if cation and frac is not None else str(support))
+        else:
+            tail = _short_name(str(c.get("_label", "")), 40) or "no support"
+        row_labels.append(f"#{i+1}: {tail}")
+    return row_labels, keep, matrix
+
+
+def make_fraction_composition_heatmap(
+    enriched_candidates: list[dict],
+    element_cols: list[str],
+    support_cations: list[str],
+    out_path: Path,
+) -> Path | None:
+    built = build_fraction_composition_matrix(
+        enriched_candidates, element_cols, support_cations,
+    )
+    if built is None:
+        return None
+    row_labels, col_labels, matrix = built
+
+    # ONE scale across every element column. Atomic fractions share a unit, so
+    # per-column normalisation (what the property heatmap does) would print a
+    # 0.001 trace element in the same colour as a 0.04 major one.
+    vmax = float(np.nanmax(matrix)) or 1.0
+
+    fig, ax = plt.subplots(figsize=(0.9 * len(col_labels) + 5,
+                                    0.6 * len(row_labels) + 2))
+    im = ax.imshow(matrix, aspect="auto", cmap=matplotlib.colormaps["magma"],
+                   vmin=0.0, vmax=vmax)
+
+    ax.set_xticks(range(len(col_labels)))
+    ax.set_xticklabels(col_labels, fontsize=9)
+    ax.set_yticks(range(len(row_labels)))
+    ax.set_yticklabels(row_labels, fontsize=8)
+
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            v = matrix[i, j]
+            if v > 0:
+                ax.text(j, i, f"{v:.3g}", ha="center", va="center",
+                        color="white" if v < 0.5 * vmax else "black", fontsize=8)
+
+    ax.set_title("Metal-phase atomic fractions (support excluded — see row label)")
+    fig.colorbar(im, ax=ax, label="atomic fraction")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)

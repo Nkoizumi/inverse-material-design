@@ -208,10 +208,11 @@ def load_csv(file_obj, use_synthetic: bool):
         msg += (
             "\n\n⚠️ Atomic-fraction mode is partially supported in the UI: "
             "Tab 3 (Catalyst Library) does not apply — the BO library is "
-            "sampled from your data instead — Tab 5's metal/support filters "
-            "become no-ops, and step 6 emits a **minimal report** (candidate "
-            "table + summary stats, no LLM narrative or figures). The "
-            "surrogate, BO and candidate table all work normally."
+            "sampled from your data instead — and Tab 5's metal/support "
+            "filters become no-ops, because this schema has no role columns "
+            "to filter on. The surrogate, BO, candidate table and the step-6 "
+            "report (LLM narrative + figures, including a metal-phase "
+            "composition heatmap) all work normally."
         )
     elif schema == "single_formula":
         msg += (
@@ -316,8 +317,10 @@ def run_pipeline(
             f"CATALYST_FRACTION_MODE={config.CATALYST_FRACTION_MODE}).")
         if schema == "fraction":
             log("Fraction mode: Tab 3's library settings are ignored (the BO "
-                "library is sampled from your data), and step 6 will emit the "
-                "minimal report.")
+                "library is sampled from your data). Step 6 writes the "
+                "fraction-mode report: support reconstructed from the dominant "
+                "Al/Si/Zr cation, one composition-weighted metal phase, plus a "
+                "metal-phase composition heatmap.")
 
         config.TARGET_COLS = list(target_cols)
         minimize_set = set(minimize_cols or [])
@@ -528,25 +531,26 @@ def candidate_detail(candidates_df: pd.DataFrame, selected_index: int,
     # + predictions. Skip the role-based lookup enrichment (not applicable).
     if _is_fraction_schema(candidates_df, run_cfg):
         elems = _from_run(run_cfg, "CATALYST_FRACTION_ELEMENTS")
-        supports = set(_from_run(run_cfg, "CATALYST_FRACTION_SUPPORT_CATIONS"))
+        supports = list(_from_run(run_cfg, "CATALYST_FRACTION_SUPPORT_CATIONS"))
         conds = _from_run(run_cfg, "CATALYST_FRACTION_CONDITIONS")
-        # Dominant support = argmax over support cations present in row
-        sup_frac = {s: float(row.get(s, 0.0)) for s in supports if s in row}
-        sup_str = ""
-        if sup_frac:
-            sup = max(sup_frac, key=sup_frac.get)
-            sup_str = f"{sup}(sup)={sup_frac[sup]:.2f}"
-        non_sup = sorted(((e, float(row.get(e, 0.0))) for e in elems
-                          if e not in supports and float(row.get(e, 0.0)) > 0.005),
-                         key=lambda t: -t[1])
-        metal_str = " ".join(f"{e}={v:.3f}" for e, v in non_sup)
+        # Same label the report writes, from the same function — this used to be
+        # a second copy of the support-argmax + metal-join logic here, which
+        # drifted from step6's (it kept a 0.005 cutoff that hides the noble
+        # metal, and a `|` separator that breaks markdown tables).
+        composition = step6_report._fraction_composition_string(
+            row, elems, supports,
+            _from_run(run_cfg, "CATALYST_FRACTION_SUPPORT_OXIDE_MAP") or None,
+        )
         parts = [f"### Candidate {int(selected_index) + 1}",
-                 f"- **Composition**: {sup_str} | {metal_str}" if sup_str else f"- **Composition**: {metal_str}"]
+                 f"- **Composition**: {composition}"]
         if conds:
             parts.append("\n#### Reaction conditions")
             for c in conds:
                 if c in row:
-                    parts.append(f"- `{c}` = {row[c]}")
+                    # Same formatter as the report, so `pretreatment` reads as
+                    # "oxidation (+1)" in both places rather than a bare 1.0.
+                    parts.append(
+                        f"- `{c}` = {step6_report._format_condition(c, row[c])}")
         parts.append("\n#### Predictions")
         for k, v in row.items():
             if k.startswith("pred_"):
@@ -614,6 +618,8 @@ def capture_run_config() -> dict:
             getattr(config, "CATALYST_FRACTION_SUPPORT_CATIONS", [])),
         "CATALYST_FRACTION_CONDITIONS": list(
             getattr(config, "CATALYST_FRACTION_CONDITIONS", [])),
+        "CATALYST_FRACTION_SUPPORT_OXIDE_MAP": dict(
+            getattr(config, "CATALYST_FRACTION_SUPPORT_OXIDE_MAP", {})),
     }
 
 

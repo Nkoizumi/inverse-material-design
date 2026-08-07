@@ -66,7 +66,9 @@ _TEMPLATE = """{%- macro fmt(v) -%}
 - Source: `{{ dataset_source }}` ({{ dataset_name }})
 - Targets: {{ targets }}
 - Samples used: {{ n_samples }}
-
+{% if schema_note %}
+{{ schema_note }}
+{% endif %}
 ## EDA highlights
 {% if eda_summary %}
 ```json
@@ -84,6 +86,13 @@ These rows are rendered **directly from the BO output**, not via the LLM. Number
 |---|---|---|{% for t in targets %}---|{% endfor %}---|
 {% for row in candidates %}| {{ loop.index }} | {{ row['_label'] }} | {{ row['_family'] }} | {% for t in targets %}{{ fmt(row.get('pred_' + t)) }} ± {{ fmt(row.get('pred_' + t + '_sd')) }} | {% endfor %}{{ row['_confidence'] }} |
 {% endfor %}
+{% if conditions_section %}
+### Process conditions selected for each candidate
+
+The BO searched composition **and** reaction conditions jointly, so a candidate is only fully specified with the row below. Rendered directly from the BO output.
+
+{{ conditions_section }}
+{% endif %}
 {% if has_bnn %}
 
 ### GP vs Bayesian-NN cross-check
@@ -133,7 +142,7 @@ Use them to cross-check any numeric claim in the narrative above.
 {% endfor %}
 {% endif %}
 {% if row.get('metal_properties') %}
-**Active metal ({{ row['active_metal'] }})**
+**{{ row['_metal_heading'] }}**
 
 | property | value |
 |---|---|
@@ -160,15 +169,39 @@ Use them to cross-check any numeric claim in the narrative above.
 """
 
 
+def _weighted_props(components: dict[str, float], lookup: pd.DataFrame,
+                    key_col: str, skip: set[str]) -> dict | None:
+    """Composition-weighted lookup values for already-resolved components,
+    rounded and stripped of NaNs. Shared by the role-based and atomic-fraction
+    enrichment paths so both quote the property numbers the same way."""
+    from catalyst_features import weighted_lookup
+
+    if not components:
+        return None
+    numeric_cols = [c for c in lookup.columns
+                    if c != key_col and c not in skip
+                    and pd.api.types.is_numeric_dtype(lookup[c])]
+    cat_cols = [c for c in lookup.columns
+                if c != key_col and c not in skip
+                and not pd.api.types.is_numeric_dtype(lookup[c])]
+    feats = weighted_lookup(components, lookup, key_col, numeric_cols, cat_cols)
+    props = {
+        k: (round(v, 3) if isinstance(v, float) else v)
+        for k, v in feats.items() if v is not None and not (isinstance(v, float) and pd.isna(v))
+    }
+    return props or None
+
+
 def _enrich_candidate(row: dict, sup_lookup: pd.DataFrame,
                       metal_lookup: pd.DataFrame) -> dict:
     """Attach the actual lookup-derived support/metal/promoter features for one
     candidate. The LLM is instructed to cite ONLY these numbers when quoting
     properties, which prevents hallucinated values like '0.49 mmol/g' for ZnO
     when the lookup says 0.15."""
-    from catalyst_features import parse_components, weighted_lookup
+    from catalyst_features import parse_components
 
     enriched = dict(row)
+    enriched["_schema"] = "role"
 
     def _props_from_lookup(cell: str | None, lookup: pd.DataFrame,
                             key_col: str, skip: set[str]) -> dict | None:
@@ -176,19 +209,7 @@ def _enrich_candidate(row: dict, sup_lookup: pd.DataFrame,
             return None
         keys = set(lookup[key_col].astype(str))
         components = parse_components(str(cell), keys)
-        if not components:
-            return None
-        numeric_cols = [c for c in lookup.columns
-                        if c != key_col and c not in skip
-                        and pd.api.types.is_numeric_dtype(lookup[c])]
-        cat_cols = [c for c in lookup.columns
-                    if c != key_col and c not in skip
-                    and not pd.api.types.is_numeric_dtype(lookup[c])]
-        feats = weighted_lookup(components, lookup, key_col, numeric_cols, cat_cols)
-        return {
-            k: (round(v, 3) if isinstance(v, float) else v)
-            for k, v in feats.items() if v is not None and not (isinstance(v, float) and pd.isna(v))
-        }
+        return _weighted_props(components, lookup, key_col, skip)
 
     sup_props = _props_from_lookup(
         row.get("support"), sup_lookup, "support", skip={"pymatgen_formula"},
@@ -209,6 +230,7 @@ def _enrich_candidate(row: dict, sup_lookup: pd.DataFrame,
         if props:
             enriched[f"{slot}_properties"] = props
 
+    enriched["_metal_heading"] = f"Active metal ({row.get('active_metal')})"
     return enriched
 
 
@@ -334,109 +356,242 @@ def _format_catalyst_label(row: dict) -> str:
         return comp_str
 
 
-def _fraction_composition_string(row: dict) -> str:
-    """Compact `Al(sup)=0.95 | Ga=0.029 Mo=0.010` label for a fraction candidate."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Atomic-fraction schema
+#
+# These candidates have no role columns: each is a flat atomic-fraction vector
+# over config.CATALYST_FRACTION_ELEMENTS plus reaction conditions. Everything
+# below reconstructs the SAME support / metal-phase decomposition that
+# catalyst_fraction_features.featurize_fractions fed the surrogate — the report
+# must not describe a catalyst the model never saw.
+# ─────────────────────────────────────────────────────────────────────────────
+_MIN_METAL_DISPLAY = 0.005   # below this an element is noise, not a component
+
+_FRACTION_SCHEMA_NOTE = (
+    "> **Schema: atomic fractions.** Each catalyst is a fraction vector over a "
+    "fixed element panel plus reaction conditions — the dataset assigns no "
+    "`active metal` / `promoter` / `support` roles. This report reconstructs "
+    "the support the way the featurizer did (dominant Al/Si/Zr cation → its "
+    "oxide) and treats every remaining element as one composition-weighted "
+    "*metal phase*. Element-level roles are therefore NOT asserted anywhere "
+    "below; the property numbers are the same weighted lookups the surrogate "
+    "was fit on."
+)
+
+
+def _fraction_of(row: dict, el: str) -> float:
+    """Atomic fraction of `el`, 0.0 when absent, non-numeric, or NaN."""
+    v = row.get(el)
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if pd.isna(f) else f
+
+
+def _fraction_support(row: dict, support_cations: list[str] | None = None,
+                      oxide_map: dict[str, str] | None = None,
+                      ) -> tuple[str | None, str | None, float]:
+    """`(support cation, reconstructed oxide key, support atomic fraction)`.
+
+    Deliberately re-uses catalyst_fraction_features.MIN_SUPPORT_FRACTION rather
+    than just taking the dominant cation: below that cutoff the featurizer
+    assigned NO support and emitted no support_phys_* block, so naming an oxide
+    here would attach lookup numbers to a candidate the surrogate scored
+    without them.
+
+    `support_cations` / `oxide_map` default to the ambient config; the webui
+    passes the panel captured with the run instead, so a candidate table stays
+    labelled by the run that produced it.
+    """
+    from catalyst_fraction_features import MIN_SUPPORT_FRACTION
+
+    cations = (support_cations if support_cations is not None
+               else getattr(config, "CATALYST_FRACTION_SUPPORT_CATIONS", []))
+    oxide_map = (oxide_map if oxide_map is not None
+                 else getattr(config, "CATALYST_FRACTION_SUPPORT_OXIDE_MAP", {}))
+    present = {c: _fraction_of(row, c) for c in cations if c in row}
+    if not present:
+        return None, None, 0.0
+    cation = max(present, key=present.get)
+    frac = present[cation]
+    if frac < MIN_SUPPORT_FRACTION:
+        return None, None, frac
+    return cation, oxide_map.get(cation), frac
+
+
+def _fraction_metal_weights(row: dict) -> dict[str, float]:
+    """Renormalized `{element: weight}` over the non-support panel elements.
+
+    Mirrors catalyst_fraction_features._join_metal_lookup_weighted (every
+    element with fraction > 0, renormalized to sum to 1) so the
+    `metal_properties` quoted in the report are numerically the metal_phys_*
+    features the surrogate was fit on.
+    """
     elems = getattr(config, "CATALYST_FRACTION_ELEMENTS", [])
     supports = set(getattr(config, "CATALYST_FRACTION_SUPPORT_CATIONS", []))
-    sup_fracs = {s: float(row.get(s, 0.0)) for s in supports if s in row}
-    sup_str = ""
-    if sup_fracs:
-        sup = max(sup_fracs, key=sup_fracs.get)
-        sup_str = f"{sup}(sup)={sup_fracs[sup]:.2f}"
-    non_sup = sorted(((e, float(row.get(e, 0.0))) for e in elems
-                      if e not in supports and float(row.get(e, 0.0)) > 0.005),
+    weights = {e: _fraction_of(row, e) for e in elems
+               if e not in supports and e in row}
+    weights = {e: v for e, v in weights.items() if v > 0}
+    total = sum(weights.values())
+    if total <= 0:
+        return {}
+    return {e: v / total for e, v in weights.items()}
+
+
+def _fraction_metal_formula(weights: dict[str, float], max_terms: int = 4) -> str:
+    """`Mg0.83Fe0.17` — metal-phase formula from renormalized weights."""
+    items = sorted(weights.items(), key=lambda kv: -kv[1])[:max_terms]
+    return "".join(f"{e}{w:.2f}" for e, w in items)
+
+
+def _fraction_composition_string(
+    row: dict,
+    element_cols: list[str] | None = None,
+    support_cations: list[str] | None = None,
+    oxide_map: dict[str, str] | None = None,
+) -> str:
+    """`Ga=0.029 Mo=0.009 Pt=0.0008 / gamma-Al2O3 (Al 0.96)` — one-line label.
+
+    Metal-phase elements first, support last, mirroring the role-mode label
+    (`5% Pt + 0.3% Sn / gamma-Al2O3`) so both schemas read the same way.
+
+    Two things this must not do. It must not contain a `|`: the label lands in
+    markdown table cells, and a pipe silently splits the row into extra
+    columns. And it must not apply a minimum-fraction cutoff to the metals —
+    the noble metal in a PDH catalyst sits around 1e-3 atomic fraction, so a
+    0.005 threshold would drop the very element the catalyst is named for.
+    Fractions are printed with `%.3g`, which keeps 0.00084 legible.
+    """
+    elems = (element_cols if element_cols is not None
+             else getattr(config, "CATALYST_FRACTION_ELEMENTS", []))
+    # Keep the configured order — `_fraction_support` breaks a tie between two
+    # equally-abundant cations by it, and a set round-trip would make that
+    # choice vary between processes.
+    support_list = list(support_cations if support_cations is not None
+                        else getattr(config, "CATALYST_FRACTION_SUPPORT_CATIONS", []))
+    supports = set(support_list)
+    cation, oxide, sup_frac = _fraction_support(row, support_list, oxide_map)
+
+    non_sup = sorted(((e, _fraction_of(row, e)) for e in elems
+                      if e not in supports and _fraction_of(row, e) > 0),
                      key=lambda t: -t[1])
-    metal_str = " ".join(f"{e}={v:.3f}" for e, v in non_sup)
-    return f"{sup_str} | {metal_str}" if sup_str else metal_str
+    metal_str = " ".join(f"{e}={v:.3g}" for e, v in non_sup)
+
+    if not cation:
+        return metal_str or "(no assigned composition)"
+    sup_str = f"{oxide or cation} ({cation} {sup_frac:.2f})"
+    return f"{metal_str} / {sup_str}" if metal_str else f"bare {sup_str}"
 
 
-def _generate_fraction_minimal_report(
-    candidates: pd.DataFrame,
-    eda_results: dict | None,
-    ts_str: str,
-    ts_file: str,
-) -> ReportBundle:
-    """Minimal report for atomic-fraction candidates: composition table + summary
-    stats. No LLM narrative, no per-candidate role-based enrichment, no figures.
-    Intended as a v0.1 graceful-degrade until fraction-mode narrative lands."""
-    log.info("Fraction-mode candidates: emitting minimal report "
-             "(no LLM narrative / role-based enrichment).")
+def _enrich_fraction_candidate(row: dict, sup_lookup: pd.DataFrame | None,
+                               metal_lookup: pd.DataFrame | None) -> dict:
+    """Atomic-fraction analogue of `_enrich_candidate`.
 
-    targets = list(config.TARGET_COLS)
-    directions = getattr(config, "OPTIMIZATION_DIRECTIONS", ["max"] * len(targets))
-    primary = targets[0] if targets else None
+    Produces the same keys the downstream machinery reads — `support`,
+    `support_properties`, `metal_properties`, `_metal_heading` — so the
+    template, the property heatmap and the prompt builder need no special
+    case beyond wording. What it does NOT produce is `active_metal` /
+    `promoter_*`: this schema carries no role labels and inventing one would
+    hand the LLM a fact the dataset does not contain.
+    """
+    enriched = dict(row)
+    enriched["_schema"] = "fraction"
 
-    top = candidates
-    if primary:
-        top = candidates.sort_values(f"pred_{primary}",
-                                     ascending=(directions[0] == "min"))
-    top = top.head(getattr(config, "REPORT_TOP_K", 10)).reset_index(drop=True)
+    cation, oxide, sup_frac = _fraction_support(row)
+    if oxide:
+        enriched["support"] = oxide
+        enriched["support_cation"] = cation
+        enriched["support_fraction"] = round(sup_frac, 4)
+        if sup_lookup is not None:
+            props = _weighted_props({oxide: 1.0}, sup_lookup, "support",
+                                    skip={"pymatgen_formula"})
+            if props:
+                enriched["support_properties"] = props
 
-    # Compact composition + predictions rows.
-    lines = [
-        f"# Inverse design report (minimal — atomic-fraction mode)",
-        f"",
-        f"- Generated: `{ts_str}`",
-        f"- Candidates: {len(candidates)}  (showing top {len(top)} by "
-        f"{'max' if directions and directions[0] == 'max' else 'min'} `{primary}`)",
-        f"- Targets: {', '.join(targets)}",
-        f"",
-        f"> Atomic-fraction schema does not yet have a full LLM narrative or "
-        f"per-candidate chemistry section. Enable role-based mode "
-        f"(`CATALYST_MODE=True, CATALYST_FRACTION_MODE=False`) with a role-shaped "
-        f"CSV for the full report, or wait for the fraction-mode narrative feature.",
-        f"",
-        f"## Top candidates",
-        f"",
-    ]
-    hdr_cols = ["#", "Composition"] + [
-        col for t in targets for col in (f"pred_{t}", f"pred_{t}_sd") if col in top.columns
-    ]
-    lines.append("| " + " | ".join(hdr_cols) + " |")
-    lines.append("|" + "|".join(["---"] * len(hdr_cols)) + "|")
-    for i, r in top.iterrows():
-        cells = [str(i + 1), _fraction_composition_string(r.to_dict())]
-        for t in targets:
-            for col in (f"pred_{t}", f"pred_{t}_sd"):
-                if col in top.columns:
-                    v = r[col]
-                    cells.append(f"{v:.4f}" if isinstance(v, float) else str(v))
+    weights = _fraction_metal_weights(row)
+    if weights:
+        formula = _fraction_metal_formula(weights)
+        enriched["metal_phase"] = {e: round(w, 3) for e, w in
+                                   sorted(weights.items(), key=lambda kv: -kv[1])}
+        enriched["metal_phase_formula"] = formula
+        enriched["_metal_heading"] = f"Metal phase ({formula}, composition-weighted)"
+        if metal_lookup is not None:
+            props = _weighted_props(weights, metal_lookup, "element", skip=set())
+            if props:
+                enriched["metal_properties"] = props
+    else:
+        enriched["_metal_heading"] = "Metal phase (none — unpromoted support)"
+
+    return enriched
+
+
+def _build_fraction_family(row: dict, sup_lookup: pd.DataFrame | None) -> str:
+    """Chemistry-style descriptor for a fraction candidate, e.g.
+    ``Mg-Fe / amphoteric oxide``. Mirrors `_build_family`'s output shape so the
+    comparison table reads the same across both schemas — but the metal part is
+    the two largest non-support elements, not a role assignment."""
+    elems = getattr(config, "CATALYST_FRACTION_ELEMENTS", [])
+    supports = set(getattr(config, "CATALYST_FRACTION_SUPPORT_CATIONS", []))
+    top = sorted(((e, _fraction_of(row, e)) for e in elems
+                  if e not in supports and _fraction_of(row, e) > _MIN_METAL_DISPLAY),
+                 key=lambda t: -t[1])[:2]
+    metal_part = "-".join(e for e, _ in top)
+
+    support = row.get("support")
+    if not support:
+        return f"{metal_part} (unsupported)" if metal_part else "unsupported"
+
+    oxide_cls = ""
+    if sup_lookup is not None and "oxide_class" in sup_lookup.columns:
+        match = sup_lookup[sup_lookup["support"].astype(str) == str(support)]
+        if len(match) == 1:
+            cls = str(match["oxide_class"].iloc[0]).strip()
+            if cls and cls != "nan":
+                oxide_cls = cls
+    descriptor = f"{oxide_cls} oxide" if oxide_cls else str(support)
+    return f"{metal_part} / {descriptor}" if metal_part else f"bare {descriptor}"
+
+
+_PRETREATMENT_LABELS = {1.0: "oxidation", -1.0: "reduction"}
+
+
+def _format_condition(col: str, value: Any) -> str:
+    """Render one reaction-condition cell. `pretreatment` is a ±1 code in the
+    ACS schema, so print what it means rather than the bare number."""
+    if _is_blank(value):
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if col == "pretreatment":
+        label = _PRETREATMENT_LABELS.get(v)
+        return f"{label} ({v:+.0f})" if label else f"{v:g}"
+    return f"{v:g}"
+
+
+def _render_conditions_section(records: list[dict]) -> str:
+    """Markdown table of the reaction conditions the BO picked per candidate.
+
+    Fraction-mode BO searches composition AND process conditions jointly, so
+    omitting them (as the old minimal report did) leaves every candidate
+    under-specified — two rows with identical compositions can differ only in
+    calcination temperature. Empty string when the schema has no condition
+    columns, which drops the whole section from the template.
+    """
+    cols = [c for c in getattr(config, "CATALYST_FRACTION_CONDITIONS", [])
+            if any(c in r for r in records)]
+    if not cols or not records:
+        return ""
+    header = "| # | Candidate | " + " | ".join(cols) + " |"
+    sep = "|---|---|" + "|".join(["---"] * len(cols)) + "|"
+    lines = [header, sep]
+    for i, r in enumerate(records, start=1):
+        cells = [str(i), str(r.get("_label", "?"))]
+        cells += [_format_condition(c, r.get(c)) for c in cols]
         lines.append("| " + " | ".join(cells) + " |")
-
-    # Summary stats of predictions across the full batch.
-    lines.extend(["", "## Prediction summary (full batch)", ""])
-    for t in targets:
-        col = f"pred_{t}"
-        if col not in candidates.columns:
-            continue
-        s = candidates[col].astype(float)
-        sd_col = f"pred_{t}_sd"
-        sd_mean = candidates[sd_col].astype(float).mean() if sd_col in candidates.columns else float("nan")
-        lines.append(f"- **{t}**: pred min/median/max = {s.min():.4f} / "
-                     f"{s.median():.4f} / {s.max():.4f}  (σ mean = {sd_mean:.4f})")
-
-    body = "\n".join(lines)
-    report_dir = getattr(config, "REPORTS_DIR", config.DATA_DIR / "reports")
-    report_dir.mkdir(exist_ok=True)
-    out_path = report_dir / f"report_{ts_file}.md"
-    out_path.write_text(body, encoding="utf-8")
-    log.info("Saved minimal fraction-mode report to %s.", out_path)
-
-    dataset_name = str(getattr(config, "CSV_PATH", "") or getattr(config, "MATMINER_DATASET", "?"))
-    return ReportBundle(
-        path=out_path,
-        ts=ts_str,
-        dataset_source=getattr(config, "DATASET_SOURCE", "?"),
-        dataset_name=Path(dataset_name).name if dataset_name else "?",
-        targets=list(targets),
-        n_samples=None,
-        eda_summary_str=None,
-        candidates_enriched=[],
-        has_bnn=False,
-        narrative_body=body,
-        per_candidate_section="",
-        figures=[],
-    )
+    return "\n".join(lines)
 
 
 def generate_report_bundle(
@@ -454,13 +609,12 @@ def generate_report_bundle(
     ts_str = now.isoformat(timespec="seconds")
     ts_file = now.strftime("%Y%m%d_%H%M%S")
 
-    # Atomic-fraction schema: role-based enrichment + per-candidate narrative
-    # bullets don't apply. Emit a minimal report (candidates table + summary
-    # stats) so the pipeline still produces an artifact without breaking on
-    # missing `active_metal` columns. Full fraction-mode narrative + figures
-    # are on the roadmap (probably arriving with DCP dataset integration).
-    if getattr(config, "CATALYST_FRACTION_MODE", False) and "active_metal" not in candidates.columns:
-        return _generate_fraction_minimal_report(candidates, eda_results, ts_str, ts_file)
+    # Atomic-fraction candidates carry no role columns, so the label, the
+    # family descriptor and the lookup enrichment each need their own
+    # reconstruction of the support / metal-phase split. Everything downstream
+    # of enrichment (figures, prompt, template) is shared with the role path.
+    is_fraction = (getattr(config, "CATALYST_FRACTION_MODE", False)
+                   and "active_metal" not in candidates.columns)
 
     directions = getattr(config, "OPTIMIZATION_DIRECTIONS", ["max"] * len(config.TARGET_COLS))
     primary_dir = directions[0] if directions else "max"
@@ -468,19 +622,28 @@ def generate_report_bundle(
                                  ascending=(primary_dir == "min")).head(config.REPORT_TOP_K)
     top_records = top.to_dict(orient="records")
     for row in top_records:
-        row["_label"] = _format_catalyst_label(row)
+        row["_label"] = (_fraction_composition_string(row) if is_fraction
+                         else _format_catalyst_label(row))
 
     enriched_records = top_records
     sup_lookup_df: pd.DataFrame | None = None
-    if config.CATALYST_MODE:
+    if config.CATALYST_MODE or is_fraction:
+        enrich = _enrich_fraction_candidate if is_fraction else _enrich_candidate
         try:
             sup_lookup_df = pd.read_csv(config.SUPPORT_LOOKUP_PATH)
             metal_lookup = pd.read_csv(config.METAL_LOOKUP_PATH)
             enriched_records = [
-                _enrich_candidate(r, sup_lookup_df, metal_lookup) for r in top_records
+                enrich(r, sup_lookup_df, metal_lookup) for r in top_records
             ]
         except Exception as e:
             log.warning("Could not enrich candidates with lookup props (%s).", e)
+            if is_fraction:
+                # The support/metal-phase split does not need the lookups —
+                # only the property values do. Without this the family column
+                # would read "unsupported" for a supported catalyst just
+                # because a CSV was unreadable.
+                enriched_records = [_enrich_fraction_candidate(r, None, None)
+                                    for r in top_records]
 
     # Deterministic Family + Confidence columns for the top-K table.
     y_stds: dict[str, float] = {}
@@ -495,8 +658,9 @@ def generate_report_bundle(
                         y_stds[t] = float(s.std())
         except Exception as e:
             log.warning("Could not load raw.parquet for Y-std normalization (%s).", e)
+    build_family = _build_fraction_family if is_fraction else _build_family
     for row in enriched_records:
-        row["_family"] = _build_family(row, sup_lookup_df)
+        row["_family"] = build_family(row, sup_lookup_df)
         row["_confidence"] = _build_confidence(row, list(config.TARGET_COLS), y_stds)
 
     agreement_summary = _build_agreement_summary(enriched_records, config.TARGET_COLS)
@@ -506,7 +670,8 @@ def generate_report_bundle(
     if summary_path.exists():
         eda_summary_str = summary_path.read_text()
 
-    figures = _build_figures(candidates, enriched_records, eda_summary_str, ts_file)
+    figures = _build_figures(candidates, enriched_records, eda_summary_str,
+                             ts_file, is_fraction=is_fraction)
 
     has_bnn = all(
         f"pred_{t}_bnn" in candidates.columns for t in config.TARGET_COLS
@@ -514,7 +679,7 @@ def generate_report_bundle(
 
     llm_narrative, captions = _ask_ollama(
         enriched_records, eda_summary_str, config.TARGET_COLS, figures,
-        agreement_summary,
+        agreement_summary, is_fraction=is_fraction,
     )
 
     # Attach the captions to the corresponding figures (fall back to the
@@ -534,12 +699,20 @@ def generate_report_bundle(
             )
 
     per_candidate_section = _render_per_candidate_section(enriched_records)
+    conditions_section = _render_conditions_section(enriched_records) if is_fraction else ""
+    if is_fraction:
+        label_kind = "Catalyst (atomic fractions)"
+    elif getattr(config, "CATALYST_MODE", False):
+        label_kind = "Catalyst"
+    else:
+        label_kind = "Composition"
     tmpl = Template(_TEMPLATE)
     md = tmpl.render(
         ts=ts_str,
         dataset_source=config.DATASET_SOURCE,
         dataset_name=config.MATMINER_DATASET if config.DATASET_SOURCE == "matminer" else str(config.CSV_PATH),
-        label_kind="Catalyst" if getattr(config, "CATALYST_MODE", False) else "Composition",
+        label_kind=label_kind,
+        schema_note=_FRACTION_SCHEMA_NOTE if is_fraction else "",
         targets=config.TARGET_COLS,
         n_samples=config.SUBSAMPLE_N,
         top_k=config.REPORT_TOP_K,
@@ -547,6 +720,7 @@ def generate_report_bundle(
         candidates=enriched_records,
         llm_narrative=llm_narrative,
         per_candidate_section=per_candidate_section,
+        conditions_section=conditions_section,
         figures=figures,
         has_bnn=has_bnn,
     )
@@ -621,7 +795,15 @@ def _render_per_candidate_section(top_candidates: list[dict]) -> str:
                 chunks.append(f"Support: {', '.join(sup_bits)}.")
 
         metal_props = c.get("metal_properties") or {}
-        m_name = c.get("active_metal")
+        # Role schema names one active metal; fraction schema has a weighted
+        # metal phase and no role labels at all — say which one this is rather
+        # than printing a mixture under an "Active …" heading.
+        if c.get("_schema") == "fraction":
+            m_name = c.get("metal_phase_formula")
+            m_prefix = "Metal phase"
+        else:
+            m_name = c.get("active_metal")
+            m_prefix = "Active"
         if metal_props and m_name:
             bits: list[str] = []
             for k, name in (
@@ -634,7 +816,7 @@ def _render_per_candidate_section(top_candidates: list[dict]) -> str:
                 if k in metal_props:
                     bits.append(f"{name}={metal_props[k]}")
             if bits:
-                chunks.append(f"Active {m_name}: {', '.join(bits)}.")
+                chunks.append(f"{m_prefix} {m_name}: {', '.join(bits)}.")
 
         for slot_key, slot_name_attr in (
             ("promoter_1_properties", "promoter_1"),
@@ -669,16 +851,36 @@ def _render_candidates_for_prompt(top_candidates: list[dict]) -> str:
         lines = [f"CANDIDATE {i}: {c.get('_label', '?')}"]
         if c.get("_family"):
             lines.append(f"  family: {c['_family']}")
-        for slot, key in (("active_metal", "active_metal"),
-                          ("promoter_1", "promoter_1"),
-                          ("promoter_2", "promoter_2"),
-                          ("support", "support")):
-            v = c.get(key)
-            if v not in (None, "", "nan"):
-                lines.append(f"  {slot}: {v}")
+        is_fraction = c.get("_schema") == "fraction"
+        if is_fraction:
+            sup, sup_frac = c.get("support"), c.get("support_fraction")
+            if sup:
+                lines.append(f"  support: {sup} (reconstructed from "
+                             f"{c.get('support_cation')} fraction {sup_frac})")
+            phase = c.get("metal_phase") or {}
+            if phase:
+                lines.append("  metal_phase (renormalized over non-support "
+                             "elements): " +
+                             ", ".join(f"{e}={w}" for e, w in phase.items()))
+            conds = {k: c.get(k)
+                     for k in getattr(config, "CATALYST_FRACTION_CONDITIONS", [])
+                     if k in c}
+            if conds:
+                lines.append("  reaction_conditions: {" +
+                             ", ".join(f"{k}={v}" for k, v in conds.items()) + "}")
+        else:
+            for slot, key in (("active_metal", "active_metal"),
+                              ("promoter_1", "promoter_1"),
+                              ("promoter_2", "promoter_2"),
+                              ("support", "support")):
+                v = c.get(key)
+                if v not in (None, "", "nan"):
+                    lines.append(f"  {slot}: {v}")
+        metal_prop_label = ("metal_phase_properties" if is_fraction
+                            else "active_metal_properties")
         for prop_key, prop_label in (
             ("support_properties", "support_properties"),
-            ("metal_properties", "active_metal_properties"),
+            ("metal_properties", metal_prop_label),
             ("promoter_1_properties", "promoter_1_properties"),
             ("promoter_2_properties", "promoter_2_properties"),
         ):
@@ -690,9 +892,32 @@ def _render_candidates_for_prompt(top_candidates: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
+_FRACTION_PROMPT_SCHEMA = (
+    "─── (0) SCHEMA: ATOMIC FRACTIONS — READ FIRST ───\n"
+    "This dataset describes each catalyst as a vector of ATOMIC FRACTIONS over "
+    "a fixed element panel, plus reaction conditions. It contains NO role "
+    "labels. Consequences you must respect:\n"
+    "  • Never call an element the 'active metal', a 'promoter', or a "
+    "'dopant' — those roles are not in the data. Say 'metal-phase "
+    "constituent', 'minor component', or name the element and its fraction.\n"
+    "  • The support shown per candidate was RECONSTRUCTED: the dominant "
+    "Al/Si/Zr cation was mapped to its oxide. It is an inference from the "
+    "composition, not a reported field — describe it as such if you mention "
+    "it.\n"
+    "  • `metal_phase_properties` are COMPOSITION-WEIGHTED averages over the "
+    "non-support elements, so they describe the metal phase as a whole, not "
+    "any single element. Do not attribute such a value to one element.\n"
+    "  • Reaction conditions (calcination/reaction temperature, pressure, "
+    "flow, pretreatment) were optimized JOINTLY with composition. A claim "
+    "about what makes the batch promising that ignores conditions is "
+    "incomplete.\n\n"
+)
+
+
 def _ask_ollama(top_candidates: list[dict], eda_summary: str | None,
                 target_cols: list[str], figures: list[FigureEntry],
-                agreement_summary: dict | None = None) -> tuple[str, dict[str, str]]:
+                agreement_summary: dict | None = None,
+                is_fraction: bool = False) -> tuple[str, dict[str, str]]:
     """Ask the local Ollama model for the narrative + per-figure captions.
 
     Returns (narrative_body, captions_dict). `captions_dict` is keyed by
@@ -731,6 +956,7 @@ def _ask_ollama(top_candidates: list[dict], eda_summary: str | None,
         "You are a materials scientist writing the analysis section of a "
         "scientific report.\n"
         f"Goal: maximize {target_cols}.\n"
+        + (_FRACTION_PROMPT_SCHEMA if is_fraction else "") +
         f"There are EXACTLY {n_candidates} candidates. They are listed below "
         "with the exact labels you MUST use, in this order:\n\n"
         f"{label_list_block}\n\n"
@@ -800,6 +1026,12 @@ def _ask_ollama(top_candidates: list[dict], eda_summary: str | None,
         "1. **Two short context paragraphs** — Pareto plot (embed it) and "
         "feature importance per target (embed it). Discuss what the figures "
         "reveal at the population level; do not name individual candidates.\n\n"
+        + ("1b. **One paragraph on composition** — embed the metal-phase "
+           "composition heatmap (figure_id=composition). Describe how much "
+           "chemical diversity the batch actually spans: which elements recur "
+           "across candidates, whether the batch is concentrated on one or two "
+           "of them, and at what fraction level. Talk about the SET, not "
+           "individual rows.\n\n" if is_fraction else "") +
         "2. **Closing paragraph on surrogate confidence** — embed BOTH the "
         "GP-vs-BNN scatter AND (if available) the parity figure "
         "(figure_id=parity). Read the parity figure's description in (D) "
@@ -808,10 +1040,21 @@ def _ask_ollama(top_candidates: list[dict], eda_summary: str | None,
         "accordingly — for CV parity, talk about generalization to unseen "
         "catalysts; for in-sample, only talk about whether the surrogate can "
         "fit its training data, and explicitly note CV would be needed for a "
-        "generalization claim. Then name the candidate with the smallest "
-        "|delta| from (C). Use the exact label and index from (C)'s "
-        "`best_agreement_candidate_label` field; do NOT name any other "
-        "candidate as having the closest agreement.\n\n"
+        "generalization claim. "
+        # Without a BNN there is no agreement summary, and ordering the model
+        # to name a best-agreement candidate anyway is what makes it invent
+        # one. Ask for the opposite statement instead.
+        + ("Then name the candidate with the smallest "
+           "|delta| from (C). Use the exact label and index from (C)'s "
+           "`best_agreement_candidate_label` field; do NOT name any other "
+           "candidate as having the closest agreement.\n\n"
+           if agreement_summary else
+           "(C) is UNAVAILABLE for this run — only one surrogate was fit, so "
+           "there is no GP-vs-BNN comparison. Say exactly that: no "
+           "cross-surrogate agreement check was available. Do NOT name a "
+           "best-agreement candidate, and do not describe any candidate as "
+           "aligning closely between models.\n\n")
+        +
         "Strict rules:\n"
         "  • Do NOT name individual candidates in the prose; the per-candidate "
         "section is rendered deterministically below your narrative.\n"
@@ -863,6 +1106,7 @@ def _build_figures(
     enriched_records: list[dict],
     eda_summary_str: str | None,
     ts: str,
+    is_fraction: bool = False,
 ) -> list[FigureEntry]:
     """Generate static PNGs (for the saved MD) + Plotly figures (for the webui).
     Returns one FigureEntry per successfully-rendered figure. `ts` is the shared
@@ -872,11 +1116,12 @@ def _build_figures(
     from plots import (
         make_pareto_plot, make_feature_importance_plot,
         make_gp_vs_bnn_scatter, make_candidate_heatmap, make_parity_plot,
+        make_fraction_composition_heatmap,
     )
     from interactive_plots import (
         make_pareto_figure, make_feature_importance_figure,
         make_gp_vs_bnn_figure, make_candidate_heatmap_figure,
-        make_parity_figure,
+        make_parity_figure, make_fraction_composition_figure,
     )
 
     out: list[FigureEntry] = []
@@ -1032,6 +1277,45 @@ def _build_figures(
             ))
     except Exception as e:
         log.warning("Candidate heatmap failed: %s", e)
+
+    # Fraction schema only: the candidate's identity IS its composition vector,
+    # and the top-K table can only show it as a one-line string. The heatmap is
+    # where you see whether the batch actually explored different chemistries
+    # or just re-picked the same element at different loadings.
+    if is_fraction:
+        try:
+            element_cols = list(getattr(config, "CATALYST_FRACTION_ELEMENTS", []))
+            support_cations = list(getattr(config, "CATALYST_FRACTION_SUPPORT_CATIONS", []))
+            fname = f"composition_{ts}.png"
+            png = make_fraction_composition_heatmap(
+                enriched_records, element_cols, support_cations,
+                config.REPORTS_DIR / fname,
+            )
+            interactive = make_fraction_composition_figure(
+                enriched_records, element_cols, support_cations,
+            )
+            if png or interactive:
+                out.append(FigureEntry(
+                    figure_id="composition",
+                    title="Metal-phase composition",
+                    alt="Metal-phase atomic fractions per candidate",
+                    default_description=(
+                        "Heatmap with rows = top candidates and columns = every "
+                        "non-support element any candidate carries. Colour is "
+                        "the atomic fraction itself on ONE shared scale "
+                        "(fractions share a unit, so no per-column "
+                        "normalisation), annotated with the raw value; blank = "
+                        "element absent. The support is excluded because it is "
+                        "~0.95 in every row — it is named in each row label "
+                        "instead. Note the scale: a trace element near 1e-3 "
+                        "reads as almost black even though it may be the "
+                        "catalytically active one."
+                    ),
+                    png_filename=fname if png else None,
+                    plotly_fig=interactive,
+                ))
+        except Exception as e:
+            log.warning("Fraction composition heatmap failed: %s", e)
 
     log.info("Generated %d figures for the report.", len(out))
     return out
