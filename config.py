@@ -6,9 +6,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 REPORTS_DIR = ROOT / "reports"
-CHECKPOINTS_DIR = ROOT / "checkpoints"
+# CHECKPOINTS_DIR was removed along with step 4's write-only surrogate pickle:
+# nothing read it, and creating the directory implied a resume capability the
+# project does not have. See step4_surrogate.fit_surrogates.
 
-for d in (DATA_DIR, REPORTS_DIR, CHECKPOINTS_DIR):
+for d in (DATA_DIR, REPORTS_DIR):
     d.mkdir(exist_ok=True)
 
 

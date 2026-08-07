@@ -209,7 +209,10 @@ def load_csv(file_obj, use_synthetic: bool):
     initial_targets = numeric_cols[:2]
     return (
         df.head(10),
-        gr.update(choices=df.columns.tolist(), value=initial_targets),
+        # Only numeric columns can be targets. Offering every column let a text
+        # column be picked, which then failed several minutes later inside
+        # prepare_xy rather than at the point of the mistake.
+        gr.update(choices=numeric_cols, value=initial_targets),
         msg,
         df,
         target_default,
@@ -673,11 +676,12 @@ with gr.Blocks(title="Inverse Material Design") as demo:
             # Keep targets_state synced with manual checkbox edits, and keep
             # the minimize-picker's choices in lockstep with the targets picked.
             def _sync_targets(picked):
+                # Clear the minimize picks whenever the target set changes: a
+                # stale "minimize deactivation_rate" tick against a target list
+                # that no longer contains it would silently drop out of
+                # OPTIMIZATION_DIRECTIONS in run_pipeline.
                 picked = picked or []
-                return picked, gr.update(
-                    choices=picked,
-                    value=[v for v in (picked or []) if False],  # reset on change
-                )
+                return picked, gr.update(choices=picked, value=[])
 
             target_select.change(
                 _sync_targets,
@@ -850,19 +854,32 @@ with gr.Blocks(title="Inverse Material Design") as demo:
                 detail_btn = gr.Button("Show details")
             candidate_detail_md = gr.Markdown()
 
-            # Refresh the sort dropdown whenever the candidate state changes.
-            # Schema-agnostic: pick every prediction column plus the training
-            # targets currently configured.
-            def _update_filters(df):
+            # Populate the table AND the sort dropdown whenever the candidate
+            # state changes. Two fixes here:
+            #
+            #  * the table used to stay empty after a run until the user
+            #    clicked "Apply filters", so the tab looked broken at exactly
+            #    the moment the results arrived;
+            #  * run_pipeline yields an empty frame on every progress tick, so
+            #    this fired repeatedly mid-run and blanked the dropdown. An
+            #    empty frame now leaves both widgets untouched (gr.skip) rather
+            #    than clearing them.
+            def _update_explore(df):
                 if df is None or len(df) == 0:
-                    return gr.update(choices=[])
+                    return gr.skip(), gr.skip()
                 target_cols = tuple(getattr(config, "TARGET_COLS", []))
                 cols = [c for c in df.columns
                         if c.startswith("pred_") or c in target_cols]
-                return gr.update(choices=cols)
+                # Default to the primary target's prediction so the first thing
+                # shown is ranked best-first rather than in acquisition order.
+                default = cols[0] if cols else None
+                shown = (filter_candidates(df, None, None, default)
+                         if default else df)
+                return shown, gr.update(choices=cols, value=default)
 
             candidates_state.change(
-                _update_filters, inputs=[candidates_state], outputs=[sort_in],
+                _update_explore, inputs=[candidates_state],
+                outputs=[candidate_table, sort_in],
             )
 
             filter_btn.click(

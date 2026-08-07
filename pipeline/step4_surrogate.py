@@ -14,7 +14,6 @@ for BNN).
 from __future__ import annotations
 
 import logging
-import pickle
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -561,15 +560,17 @@ def fit_surrogates(df: pd.DataFrame) -> dict:
     _save_training_predictions(data, out)
     _save_cv_parity_predictions(df)
 
-    ckpt = config.CHECKPOINTS_DIR / "surrogates.pkl"
-    # GP state via state_dict; BNN via Pyro param store. Pickle the whole dict for now
-    # (works for GP; BNN reload needs pyro.get_param_store() handling — skeleton-only).
-    try:
-        with open(ckpt, "wb") as f:
-            pickle.dump({k: v for k, v in out.items() if k != "data"}, f)
-        log.info("Saved surrogates to %s.", ckpt)
-    except Exception as e:
-        log.warning("Could not pickle surrogates (%s). Skipping checkpoint.", e)
+    # NOTE: this used to pickle the fitted surrogates to
+    # CHECKPOINTS_DIR/surrogates.pkl. Nothing ever read that file — not step 5,
+    # not step 6, not the web UI — and its own comment conceded the BNN could
+    # not be reloaded from it anyway (Pyro keeps its variational parameters in
+    # a global param store that the pickle does not capture). It was a
+    # write-only artifact that implied a resume capability the project does not
+    # have. Removed rather than repaired: step 4 is not the expensive stage
+    # (step 5's discrete acquisition is), so checkpointing it buys little.
+    # If surrogate reuse is wanted later, it needs a real design — GP
+    # state_dict plus pyro.get_param_store().save(), and a loader that
+    # rebuilds XYData so feature_cols and the standardization moments match.
 
     return out
 

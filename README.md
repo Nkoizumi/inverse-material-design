@@ -188,7 +188,7 @@ inverse_material_design/
 ├── data/                  # cached datasets + featurized DataFrames
 ├── data/lookups/          # curated metal / support property tables
 ├── reports/               # generated reports (gitignored)
-└── checkpoints/           # surrogate model state (gitignored)
+└── tests/                 # pytest suite (see "Tests" above)
 ```
 
 ## Data provenance
