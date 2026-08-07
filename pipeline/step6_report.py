@@ -681,7 +681,8 @@ def generate_report_bundle(
         enriched_records, eda_summary_str, config.TARGET_COLS, figures,
         agreement_summary, is_fraction=is_fraction,
     )
-    llm_narrative = _repair_figure_links(llm_narrative, figures)
+    llm_narrative = _normalize_narrative_headings(
+        _repair_figure_links(llm_narrative, figures))
 
     # Attach the captions to the corresponding figures (fall back to the
     # hand-written default_description if the LLM didn't provide one).
@@ -813,18 +814,77 @@ def _repair_figure_links(narrative: str, figures: list[FigureEntry]) -> str:
                     for fn in fns}
         return next(iter(hits)) if len(hits) == 1 else None
 
+    alt_by_file = {f.png_filename: f.alt for f in figures if f.png_filename}
+
+    def _alt_for(alt: str, filename: str) -> str:
+        """Keep a written-out alt; replace a filename masquerading as one.
+
+        The model frequently emits `![pareto_20260807_202446.png](pareto_…png)`.
+        That is not alt text — a screen reader would read the timestamp aloud —
+        and FigureEntry already carries a description written for the purpose.
+        """
+        stripped = alt.strip()
+        looks_like_filename = (
+            not stripped
+            or stripped.lower().endswith((".png", ".jpg", ".svg"))
+            or _figure_link_key(stripped) == _figure_link_key(filename)
+        )
+        return alt_by_file.get(filename, stripped) if looks_like_filename else stripped
+
     def _sub(m: re.Match) -> str:
         alt, cited = m.group(1), m.group(2)
         fixed = _resolve(cited)
-        if fixed == cited:
-            return m.group(0)
-        if fixed:
+        if not fixed:
+            log.warning("Dropped unresolvable figure link from narrative: %r.", cited)
+            return ""
+        if fixed != cited:
             log.info("Repaired figure link in narrative: %r → %r.", cited, fixed)
-            return f"![{alt}]({fixed})"
-        log.warning("Dropped unresolvable figure link from narrative: %r.", cited)
-        return ""
+        new_alt = _alt_for(alt, fixed)
+        if new_alt != alt:
+            log.info("Replaced filename-shaped alt text for %r.", fixed)
+        return f"![{new_alt}]({fixed})"
 
     return _MD_IMAGE_RE.sub(_sub, narrative)
+
+
+# Headings the model echoes back from the prompt's own task description
+# ("PART 2 — NARRATIVE BODY (markdown)") rather than titling its content with.
+_STRAY_HEADING_RE = re.compile(
+    r"^(?:part\s*\d+\b.*|narrative(?:\s+body)?(?:\s*\(markdown\))?"
+    r"|markdown\s+narrative|narrative\s+section)$",
+    re.IGNORECASE,
+)
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*$", re.MULTILINE)
+
+
+def _normalize_narrative_headings(narrative: str) -> str:
+    """Drop echoed task labels, and nest the model's headings under the report's.
+
+    The narrative is rendered inside the report's own `## Why these materials
+    are promising` section, so a `##` heading from the model becomes a SIBLING
+    of `## Per-candidate notes` — the document then reads as though the
+    narrative ended where it did not. Relative depth between the model's own
+    headings is preserved; only the whole block is pushed down to `###`.
+    """
+    if not narrative:
+        return narrative
+
+    def _drop_stray(m: re.Match) -> str:
+        text = m.group(2).strip().rstrip(":.-—– ")
+        if _STRAY_HEADING_RE.match(text):
+            log.info("Dropped echoed task heading from narrative: %r.", text)
+            return ""
+        return m.group(0)
+
+    out = _HEADING_RE.sub(_drop_stray, narrative)
+
+    levels = [len(m.group(1)) for m in _HEADING_RE.finditer(out)]
+    if levels and min(levels) < 3:
+        shift = 3 - min(levels)
+        out = _HEADING_RE.sub(
+            lambda m: f"{'#' * min(6, len(m.group(1)) + shift)} {m.group(2)}", out,
+        )
+    return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
 def _render_per_candidate_section(top_candidates: list[dict]) -> str:
@@ -1008,8 +1068,11 @@ def _ask_ollama(top_candidates: list[dict], eda_summary: str | None,
     figure_block = "(no figures available)" if not figure_lines else "\n".join(figure_lines)
 
     n_candidates = len(top_candidates)
+    # ensure_ascii=False or the model copies the escape verbatim: the
+    # interpretation string contains "|Δ| = 0.014", which json.dumps renders as
+    # "|\u0394| = 0.014", and phi-4 reproduced that literally in the narrative.
     agreement_block = (
-        json.dumps(agreement_summary, indent=2)
+        json.dumps(agreement_summary, indent=2, ensure_ascii=False)
         if agreement_summary else "(GP-vs-BNN agreement summary unavailable)"
     )
 
@@ -1053,7 +1116,7 @@ def _ask_ollama(top_candidates: list[dict], eda_summary: str | None,
         "state plainly that the data does not support a feature-importance "
         "claim for that target rather than falling back on generic "
         "catalysis intuition.\n\n"
-        f"{json.dumps(feature_rankings, indent=2)}\n\n"
+        f"{json.dumps(feature_rankings, indent=2, ensure_ascii=False)}\n\n"
         "─── (C) GP-vs-BNN AGREEMENT SUMMARY ───\n"
         "Use this exact information in your surrogate-confidence paragraph; "
         "do not invert it.\n\n"

@@ -139,3 +139,103 @@ def test_saved_report_has_no_dead_image_links(tmp_path, monkeypatch):
     missing = [c for c in cited if not (tmp_path / c).exists()]
     assert not missing, f"report links to files that do not exist: {missing}"
     assert "invented_thing.png" not in body
+
+
+# ── alt text ─────────────────────────────────────────────────────────────────
+def test_a_filename_shaped_alt_is_replaced_with_the_figure_description():
+    """`![pareto_20260807_202446.png](…)` is not alt text — a screen reader
+    would read the timestamp aloud."""
+    figs = _figs("pareto")
+    figs[0].alt = "Pareto frontier of training data and BO candidates"
+    out = _repair_figure_links(f"![pareto_{TS}.png](pareto_{TS}.png)", figs)
+    assert out == f"![Pareto frontier of training data and BO candidates](pareto_{TS}.png)"
+
+
+def test_an_empty_alt_is_filled_in():
+    figs = _figs("composition")
+    figs[0].alt = "Metal-phase atomic fractions per candidate"
+    out = _repair_figure_links(f"![](composition_{TS}.png)", figs)
+    assert out == f"![Metal-phase atomic fractions per candidate](composition_{TS}.png)"
+
+
+def test_a_written_out_alt_is_kept():
+    figs = _figs("pareto")
+    figs[0].alt = "Pareto frontier"
+    md = f"![Trade-off between yield and deactivation](pareto_{TS}.png)"
+    assert _repair_figure_links(md, figs) == md
+
+
+def test_alt_without_an_extension_but_matching_the_key_is_replaced():
+    figs = _figs("gp_vs_bnn")
+    figs[0].alt = "GP vs Bayesian-NN agreement scatter"
+    out = _repair_figure_links(f"![gp_vs_bnn](gp_vs_bnn_{TS}.png)", figs)
+    assert out.startswith("![GP vs Bayesian-NN agreement scatter]")
+
+
+# ── headings ─────────────────────────────────────────────────────────────────
+from step6_report import _normalize_narrative_headings as _norm  # noqa: E402
+
+
+def test_the_echoed_task_heading_is_dropped():
+    """phi-4 echoes the prompt's own 'PART 2 — NARRATIVE BODY' label."""
+    assert "Narrative Body" not in _norm("## Narrative Body\n\nReal prose.")
+    assert "Real prose." in _norm("## Narrative Body\n\nReal prose.")
+
+
+@pytest.mark.parametrize("heading", [
+    "## Narrative Body", "# Narrative", "## PART 2 — NARRATIVE BODY (markdown)",
+    "### Narrative body (markdown)", "## Markdown Narrative",
+])
+def test_task_label_variants_are_all_dropped(heading):
+    assert "arrative" not in _norm(f"{heading}\n\ntext")
+
+
+def test_a_real_section_heading_is_kept():
+    assert "Surrogate Confidence" in _norm("## Surrogate Confidence\n\ntext")
+
+
+def test_headings_are_demoted_to_nest_under_the_report_section():
+    """A `##` from the model would otherwise sit as a sibling of the report's
+    own `## Per-candidate notes`, making the narrative look finished early."""
+    out = _norm("## Contextual Analysis\n\na\n\n## Surrogate Confidence\n\nb")
+    assert out.count("### ") == 2
+    assert "\n## " not in out and not out.startswith("## ")
+
+
+def test_relative_heading_depth_survives_demotion():
+    out = _norm("# Top\n\na\n\n## Sub\n\nb")
+    assert "### Top" in out and "#### Sub" in out
+
+
+def test_already_nested_headings_are_left_alone():
+    md = "### Contextual Analysis\n\na"
+    assert _norm(md) == md
+
+
+def test_narrative_without_headings_is_unchanged():
+    assert _norm("just prose") == "just prose"
+    assert _norm("") == ""
+
+
+# ── prompt encoding ──────────────────────────────────────────────────────────
+def test_the_agreement_block_carries_real_unicode_not_escapes(monkeypatch):
+    """json.dumps defaults to ensure_ascii=True, so the summary's "|Δ| = 0.014"
+    reached the model as "|\\u0394| = 0.014" — and phi-4 copied the escape into
+    the narrative verbatim."""
+    captured = {}
+
+    class _FakeOllama:
+        @staticmethod
+        def chat(model, messages, options=None):
+            captured["prompt"] = messages[0]["content"]
+            return {"message": {"content": "narrative"}}
+
+    monkeypatch.setitem(__import__("sys").modules, "ollama", _FakeOllama)
+
+    step6_report._ask_ollama(
+        [{"_label": "x"}], None, ["y"], [],
+        agreement_summary={"interpretation": "smallest |Δ| = 0.014",
+                           "per_candidate_abs_delta": []},
+    )
+    assert "|Δ| = 0.014" in captured["prompt"]
+    assert "\\u0394" not in captured["prompt"]
