@@ -305,3 +305,13 @@ LIBRARY_PROMO_LOADINGS = [0.3, 1.0]
 # Report
 REPORT_LLM_MODEL = "phi4:14b-q4_K_M"   # solid non-thinking model; qwen3:32b enters chain-of-thought and stalls
 REPORT_TOP_K = 5
+
+# How long Ollama keeps the report model in VRAM after step 6 finishes, in the
+# form Ollama's `keep_alive` accepts (0 = unload immediately, "5m" = Ollama's
+# default, -1 = keep forever). Ollama and steps 4-5 share one GPU: step 5's
+# acquisition peaks at ~3.2 GB allocated, so on a 24 GB card any model leaving
+# less than that free makes the *next* run fail with a CUDA OOM. Measured
+# 2026-08-08: phi4:14b (10 GB resident) is safe, qwen3:32b (20 GB) is not.
+# Set to "5m" if you re-run reports back-to-back and would rather pay VRAM than
+# a model reload.
+REPORT_LLM_KEEP_ALIVE = 0

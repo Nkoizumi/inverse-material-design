@@ -825,6 +825,11 @@ def _ask_ollama(top_candidates: list[dict], eda_summary: str | None,
             model=config.REPORT_LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.3},
+            # Unload the model as soon as the narrative is written. Ollama and
+            # steps 4-5 share one GPU; a resident 20 GB model leaves less than
+            # the ~3.2 GB peak that step 5's acquisition needs, so the *next*
+            # run OOMs. Costs one model reload per report.
+            keep_alive=config.REPORT_LLM_KEEP_ALIVE,
         )
         content = resp["message"]["content"]
     except Exception as e:

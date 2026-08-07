@@ -103,6 +103,9 @@ SETTINGS: dict[str, tuple] = {
     # report
     "REPORT_LLM_MODEL": (str,),
     "REPORT_TOP_K": (int,),
+    # Ollama `keep_alive`: seconds as int/float, a duration string like "5m",
+    # or -1 for "never unload".
+    "REPORT_LLM_KEEP_ALIVE": (int, float, str),
 }
 
 
