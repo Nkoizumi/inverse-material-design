@@ -1190,31 +1190,16 @@ def _deterministic_parity_caption(llm_caption_raw: str) -> str:
 def _parity_stats_lines(parity_df: pd.DataFrame, target_cols: list[str]) -> str:
     """Per (surrogate, target) held-out R² and MAE, as bullet lines for the
     LLM prompt. Lets the LLM ground its caption in real numbers instead of
-    defaulting to generic 'tight clustering' praise."""
-    import numpy as np
-    lines = []
-    for t in target_cols:
-        true_col = f"true_{t}"
-        if true_col not in parity_df.columns:
-            continue
-        y_true = parity_df[true_col].values
-        for kind in ("gp", "svgp", "bnn"):
-            mean_col = f"{kind}_pred_{t}"
-            if mean_col not in parity_df.columns:
-                continue
-            y_pred = parity_df[mean_col].values
-            mask = ~(np.isnan(y_true) | np.isnan(y_pred))
-            if mask.sum() < 2:
-                continue
-            yt, yp = y_true[mask], y_pred[mask]
-            ss_tot = float(np.sum((yt - np.mean(yt)) ** 2))
-            ss_res = float(np.sum((yt - yp) ** 2))
-            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-            mae = float(np.mean(np.abs(yt - yp)))
-            lines.append(
-                f"  - {kind.upper()} on {t}: R² = {r2:.3f}, MAE = {mae:.3g} "
-                f"(n = {int(mask.sum())})"
-            )
+    defaulting to generic 'tight clustering' praise.
+
+    Shares _compute_parity_stats with the deterministic caption: these were
+    two independent copies of the same R²/MAE arithmetic, so a fix to one
+    would have silently disagreed with the other in the SAME report.
+    """
+    lines = [
+        f"  - {kind.upper()} on {target}: R² = {r2:.3f}, MAE = {mae:.3g} (n = {n})"
+        for kind, target, r2, mae, n in _compute_parity_stats(parity_df, target_cols)
+    ]
     return "\n".join(lines) if lines else "  (stats unavailable)"
 
 
