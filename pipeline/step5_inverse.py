@@ -14,6 +14,7 @@ Two modes, picked by ``config.CATALYST_MODE``:
 from __future__ import annotations
 
 import logging
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,18 @@ log = logging.getLogger(__name__)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.double
+
+
+class Selection(NamedTuple):
+    """A BO batch plus the exact standardized features it was scored on.
+
+    Carrying X_std out of the `_run_*` functions is what lets the BNN
+    cross-check evaluate the same points the driver did. Re-deriving the
+    features from `candidates` is not equivalent — see
+    `_attach_bnn_predictions`.
+    """
+    candidates: pd.DataFrame
+    X_std: torch.Tensor
 
 
 def _get_signs(n_targets: int) -> torch.Tensor:
@@ -72,53 +85,61 @@ def run_inverse(df: pd.DataFrame, surrogates: dict,
         raise RuntimeError("No surrogate available — fit one in step 4 first.")
 
     if getattr(config, "CATALYST_FRACTION_MODE", False):
-        out = _run_catalyst_fraction_discrete(df, data, surrogate)
+        selection = _run_catalyst_fraction_discrete(df, data, surrogate)
     elif config.CATALYST_MODE:
-        out = _run_catalyst_discrete(df, data, surrogate, transformer=transformer)
+        selection = _run_catalyst_discrete(df, data, surrogate, transformer=transformer)
     elif getattr(config, "STEELS_LIBRARY", False):
-        out = _run_steels_discrete(df, data, surrogate, transformer=transformer)
+        selection = _run_steels_discrete(df, data, surrogate, transformer=transformer)
     else:
-        out = _run_continuous(df, data, surrogate)
+        selection = _run_continuous(df, data, surrogate)
 
-    # If GP is driving and BNN is also fit, attach BNN predictions for the
-    # selected candidates so the report can show a GP-vs-BNN comparison.
-    # BNN cross-check is currently wired only for role-based catalyst mode
-    # (uses CatalystFeaturizer). Skip in atomic-fraction mode for now — the
-    # report's GP-vs-BNN scatter just won't render for those rows.
-    if gp is not None and bnn is not None and not getattr(
-        config, "CATALYST_FRACTION_MODE", False
-    ):
-        out = _attach_bnn_predictions(out, data, bnn)
-        out.to_parquet(config.DATA_DIR / "candidates.parquet")
-    elif surrogate is svgp and bnn is not None:
-        # SVGP driver + BNN cross-check: same parquet layout, so step6's
-        # GP-vs-BNN comparison plot still works (the "GP" axis is SVGP).
-        out = _attach_bnn_predictions(out, data, bnn)
+    out = selection.candidates
+
+    # If a BNN is also fit, attach its predictions for the selected candidates
+    # so the report can show a GP-vs-BNN comparison. Works in every mode: the
+    # cross-check now scores the SAME feature tensor the driver scored rather
+    # than re-deriving one from the displayed candidate table.
+    if bnn is not None and surrogate is not bnn:
+        out = _attach_bnn_predictions(out, data, bnn, selection.X_std)
         out.to_parquet(config.DATA_DIR / "candidates.parquet")
 
     return out
 
 
-def _attach_bnn_predictions(candidates_df: pd.DataFrame, data: XYData, bnn) -> pd.DataFrame:
-    """Re-featurize the selected candidates' standardized X and predict with BNN."""
-    from catalyst_features import CatalystFeaturizer
-    from catalyst_library import build_library  # noqa  (kept for parity if needed)
+def _attach_bnn_predictions(candidates_df: pd.DataFrame, data: XYData, bnn,
+                            X_std: torch.Tensor) -> pd.DataFrame:
+    """Score the BNN on the SAME standardized features the driver scored.
 
-    if not config.CATALYST_MODE:
-        log.info("BNN cross-check is only wired for catalyst mode; skipping.")
+    This used to re-featurize `candidates_df` with a fresh CatalystFeaturizer
+    and push the result through `_align_to_training`, which zero-fills any
+    column it can't find. That produced a systematically different input than
+    the one the GP saw, because the displayed candidate table carries only
+    composition — active_metal, promoters, support and loadings. Every
+    reaction condition (`reaction_temp_C`, `WHSV_h`, `H2_HC_ratio`, …) was
+    therefore zero-filled for the BNN and its `{col}_present` indicator set to
+    0, while step 2a had filled exactly those columns with the TRAINING MEDIAN
+    for the GP. Any Tab-2 transformer was skipped as well.
+
+    The Δ column in the report — which the LLM is told to cite as a
+    surrogate-confidence signal, and which `_build_agreement_summary` uses to
+    name the "safest GP-BNN-aligned pick" — was thus a mixture of genuine
+    model disagreement and a pure input artifact.
+
+    Using the driver's own tensor removes the artifact, and as a side effect
+    drops the CatalystFeaturizer dependency that restricted the cross-check to
+    role-based catalyst mode.
+    """
+    if X_std is None:
+        log.info("No feature tensor available for the selected candidates; "
+                 "skipping BNN cross-check.")
         return candidates_df
-
-    cf = CatalystFeaturizer(
-        roles=config.CATALYST_ROLES,
-        loadings=config.CATALYST_LOADINGS,
-        support_lookup_path=config.SUPPORT_LOOKUP_PATH,
-        metal_lookup_path=config.METAL_LOOKUP_PATH,
-        optional_numeric_features=getattr(config, "OPTIONAL_NUMERIC_FEATURES", []),
-    )
-    feat = cf.fit_transform(candidates_df)
-    X_raw = _align_to_training(feat, data.feature_cols)
-    X = torch.tensor(X_raw, dtype=DTYPE, device=DEVICE)
-    X_std = (X - data.x_mean) / data.x_std
+    if X_std.shape[0] != len(candidates_df):
+        log.warning(
+            "BNN cross-check skipped: %d feature rows for %d candidates. The "
+            "selection and its tensor must stay in lockstep.",
+            X_std.shape[0], len(candidates_df),
+        )
+        return candidates_df
 
     mean_std, sd_std = bnn.predict(X_std)
     pred_real = mean_std * data.y_std + data.y_mean
@@ -128,14 +149,15 @@ def _attach_bnn_predictions(candidates_df: pd.DataFrame, data: XYData, bnn) -> p
     for t, name in enumerate(data.target_cols):
         out[f"pred_{name}_bnn"] = pred_real[:, t].detach().cpu().numpy()
         out[f"pred_{name}_bnn_sd"] = pred_sd_real[:, t].detach().cpu().numpy()
-    log.info("Attached BNN cross-check predictions to %d candidates.", len(out))
+    log.info("Attached BNN cross-check predictions to %d candidates "
+             "(scored on the driver's own feature tensor).", len(out))
     return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Continuous (single-formula) path
 # ─────────────────────────────────────────────────────────────────────────────
-def _run_continuous(df: pd.DataFrame, data: XYData, surrogate) -> pd.DataFrame:
+def _run_continuous(df: pd.DataFrame, data: XYData, surrogate) -> Selection:
     multi_objective = data.Y.shape[1] > 1
     log.info("Continuous %s …", "MOBO (qLogNEHVI)" if multi_objective else "BO (qLogNEI)")
 
@@ -158,7 +180,7 @@ def _run_continuous(df: pd.DataFrame, data: XYData, surrogate) -> pd.DataFrame:
     out_path = config.DATA_DIR / "candidates.parquet"
     out.to_parquet(out_path)
     log.info("Saved %d candidates to %s.", len(out), out_path)
-    return out
+    return Selection(out, candidates_std)
 
 
 def _optimize_continuous(surrogate, data: XYData, multi_objective: bool) -> torch.Tensor:
@@ -214,7 +236,7 @@ def _nearest_known(candidates: torch.Tensor, data: XYData, df: pd.DataFrame) -> 
 # Catalyst discrete path
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
-                            transformer=None) -> pd.DataFrame:
+                            transformer=None) -> Selection:
     from catalyst_features import CatalystFeaturizer
     from catalyst_library import build_library
 
@@ -411,11 +433,11 @@ def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
     selected.to_parquet(out_path)
     log.info("Selected %d catalyst candidates from library of %d.",
              len(selected), len(library_raw))
-    return selected
+    return Selection(selected, sel_X)
 
 
 def _run_catalyst_fraction_discrete(df: pd.DataFrame, data: XYData,
-                                     surrogate) -> pd.DataFrame:
+                                     surrogate) -> Selection:
     """Discrete BO over an empirical atomic-fraction catalyst library.
 
     Companion to `_run_catalyst_discrete` (role-based path). Same acquisition
@@ -570,11 +592,11 @@ def _run_catalyst_fraction_discrete(df: pd.DataFrame, data: XYData,
     selected.to_parquet(out_path)
     log.info("Selected %d catalyst candidates from library of %d.",
              len(selected), len(library_raw))
-    return selected
+    return Selection(selected, sel_X)
 
 
 def _run_steels_discrete(df: pd.DataFrame, data: XYData, surrogate,
-                          transformer=None) -> pd.DataFrame:
+                          transformer=None) -> Selection:
     """Discrete BO over a random Fe-balanced steel library. Same acquisition
     plumbing as the catalyst path; differences are the library builder and the
     matminer single-formula featurizer (Magpie + Stoichiometry)."""
@@ -709,7 +731,7 @@ def _run_steels_discrete(df: pd.DataFrame, data: XYData, surrogate,
     selected.to_parquet(out_path)
     log.info("Selected %d steel candidates from library of %d.",
              len(selected), len(library_raw))
-    return selected
+    return Selection(selected, sel_X)
 
 
 def _align_to_training(library_feat: pd.DataFrame, training_feature_cols: list[str]) -> np.ndarray:

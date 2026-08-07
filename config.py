@@ -192,6 +192,16 @@ BNN_TRAINING_ITERS = 1000
 SVGP_NUM_INDUCING = 256      # inducing points; clamped to N if smaller
 SVGP_TRAINING_ITERS = 400
 
+# Posterior samples drawn per BNN prediction. This is a Monte-Carlo estimate,
+# so the sample count sets the noise floor of every BNN number in the report.
+# Measured on the PDH literature set (n=85, q=20 candidates): two independent
+# draws of the BNN mean disagreed by 0.030 at 50 samples — as large as the
+# GP-vs-BNN delta (~0.027) the report cites as a confidence signal, i.e. the
+# "closest agreement" candidate was being picked out of noise. 512 puts the
+# estimator noise ~3x below that signal (0.009) and costs milliseconds at
+# these batch sizes.
+BNN_PREDICT_SAMPLES = 512
+
 # Feature reduction cap fed to the surrogate. With small-n catalyst datasets
 # (n_train ~ 60) and matminer + lookup features (~500–600 dims), the GP
 # kernel length-scales optimize tight and the posterior collapses to the

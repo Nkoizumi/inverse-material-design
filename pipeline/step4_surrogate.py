@@ -512,9 +512,15 @@ class BNNSurrogate(Surrogate):
         log.info("BNN fit complete (N=%d, in=%d, out=%d).",
                  data.X.shape[0], self.in_dim, self.out_dim)
 
-    def predict(self, X: torch.Tensor, n_samples: int = 50) -> tuple[torch.Tensor, torch.Tensor]:
+    def predict(self, X: torch.Tensor,
+                n_samples: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Monte-Carlo posterior predictive. See config.BNN_PREDICT_SAMPLES for
+        why the default is not small — the sample count is the noise floor of
+        every BNN number that reaches the report."""
         from pyro.infer import Predictive
 
+        if n_samples is None:
+            n_samples = int(getattr(config, "BNN_PREDICT_SAMPLES", 512))
         predictive = Predictive(self.model_fn, guide=self.guide, num_samples=n_samples,
                                 return_sites=("obs",))
         samples = predictive(X)["obs"]   # (S, N, out_dim)

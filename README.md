@@ -117,6 +117,9 @@ Everything is in `config.py`. Key knobs:
 - `TARGET_COLS`, `OPTIMIZATION_DIRECTIONS` — what to optimize, in which direction.
 - `CATALYST_MODE` / `CATALYST_FRACTION_MODE` — schema of the input CSV.
 - `MAX_GP_FEATURES` — Pearson-|r| cap on features fed to the GP (default 30).
+- `BNN_PREDICT_SAMPLES` — posterior draws per BNN prediction (default 512).
+  This is the noise floor of every BNN number in the report; see the comment
+  in `config.py` for the measurement behind the default.
 - `BO_MAX_PER_FAMILY` — family-diversity cap for the BO batch (default 4 for fraction mode; disabled for role-based).
 - `SURROGATE_KIND` — `gp` (default), `bnn`, or `both`.
 - `CV_FOLDS` — 5-fold CV for parity plots (0 to disable).
