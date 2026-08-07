@@ -256,6 +256,52 @@ def test_row_alignment_refuses_on_any_row_count_change(before, after):
     assert "wrong catalyst" in msg
 
 
+# ── R1: the correlation heatmap's column cap ─────────────────────────────────
+def test_no_cap_note_when_everything_fits():
+    df = pd.DataFrame({f"c{i}": [1.0, 2.0, 3.0] for i in range(5)})
+    cols, note = eda_tab._correlation_columns(df, list(df.columns))
+    assert cols == list(df.columns)
+    assert note == ""
+
+
+def test_cap_selects_by_variance_not_column_order():
+    """The bug: `num_cols[:30]` showed whichever columns came first in the CSV.
+    A user reading 'no high-correlation pairs' off that slice learns nothing
+    about their dataset."""
+    rng = np.random.default_rng(0)
+    data = {f"flat{i}": rng.normal(scale=1e-6, size=200) for i in range(30)}
+    for i in range(9):
+        data[f"real{i}"] = rng.normal(scale=10, size=200)
+    data["real_twin"] = data["real0"] * 2          # a perfect correlation pair
+    df = pd.DataFrame(data)
+    num = list(df.columns)
+
+    cols, note = eda_tab._correlation_columns(df, num)
+
+    # The old rule would have shown 30 near-constant columns and neither half
+    # of the only correlated pair in the frame.
+    assert "real0" in cols and "real_twin" in cols
+    assert len(cols) == eda_tab.CORRELATION_COLUMN_CAP
+    assert note
+
+
+def test_cap_preserves_original_column_order():
+    """Axes should read in the order the user's file has, not variance order."""
+    rng = np.random.default_rng(1)
+    df = pd.DataFrame({f"c{i}": rng.normal(scale=i + 1, size=50) for i in range(40)})
+    cols, _ = eda_tab._correlation_columns(df, list(df.columns))
+    assert cols == [c for c in df.columns if c in set(cols)]
+
+
+def test_cap_note_says_columns_are_hidden():
+    """Silence about a truncation reads as 'this is everything'."""
+    rng = np.random.default_rng(2)
+    df = pd.DataFrame({f"c{i}": rng.normal(scale=i + 1, size=50) for i in range(40)})
+    _, note = eda_tab._correlation_columns(df, list(df.columns))
+    assert "not shown" in note
+    assert "not evidence there is none" in note
+
+
 # ── W9: only numeric columns may be offered as targets ───────────────────────
 def test_target_choices_exclude_non_numeric_columns():
     """A text column picked as a target failed minutes later inside prepare_xy
