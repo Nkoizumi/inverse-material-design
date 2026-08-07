@@ -117,12 +117,44 @@ Everything is in `config.py`. Key knobs:
 - `TARGET_COLS`, `OPTIMIZATION_DIRECTIONS` — what to optimize, in which direction.
 - `CATALYST_MODE` / `CATALYST_FRACTION_MODE` — schema of the input CSV.
 - `MAX_GP_FEATURES` — Pearson-|r| cap on features fed to the GP (default 30).
+- `BNN_PREDICT_SAMPLES` — posterior draws per BNN prediction (default 512).
+  This is the noise floor of every BNN number in the report; see the comment
+  in `config.py` for the measurement behind the default.
 - `BO_MAX_PER_FAMILY` — family-diversity cap for the BO batch (default 4 for fraction mode; disabled for role-based).
 - `SURROGATE_KIND` — `gp` (default), `bnn`, or `both`.
 - `CV_FOLDS` — 5-fold CV for parity plots (0 to disable).
 
+- `RANDOM_STATE` — seeds python / numpy / torch and the BO acquisition
+  sampler. Two runs of the same preset select the same catalysts.
+
 Presets in `run_pipeline.py` override these in-process — see the `PRESETS`
 dict for exact settings.
+
+## Performance notes
+
+The catalyst featurizers resolve each **distinct** cell value once and
+broadcast the result, which matters because a BO library is a Cartesian
+product: the default 101,816-row role-based library contains only 11 distinct
+active metals, 5 promoter-1 values, 6 promoter-2 values and 26 supports.
+
+| stage | time |
+|---|---|
+| role-based library, 101,816 rows | ~6 s |
+| atomic-fraction library, 10,000 rows | ~6 s |
+| discrete acquisition over 100k choices (q=80, MOBO) | ~4–5 min |
+
+Featurization is therefore no longer what limits library size — the discrete
+acquisition is. Installing `ninja` lets BoTorch compile its fused qLogEHVI
+kernel for a further ~3× on the multi-objective path.
+
+## Tests
+
+```bash
+python -m pytest tests/
+```
+
+Covers target-twin / preset consistency, `prepare_xy`'s leakage and
+constant-column guards, parity-artifact staleness, and BO reproducibility.
 
 ## Layout
 
@@ -162,8 +194,13 @@ inverse_material_design/
 - PDH literature dataset (n=85) is data-limited. Cannot separate
   composition from reaction conditions cleanly at this sample size. Use
   ACS (n=210) or wait for the DCP dataset for anything beyond exploration.
-- The auto-EDA step relies on a local Ollama daemon at
-  `http://localhost:11434`. Skip with `--skip eda` if you don't have one.
+- The auto-EDA step (step 3) needs **two** things that are not pip
+  dependencies: a local Ollama daemon at `http://localhost:11434`, and a
+  checkout of the separate [llm-eda-mobo](https://github.com/Nkoizumi/llm-eda-mobo)
+  project. Point `INVERSE_DESIGN_AUTO_EDA_PATH` at that checkout, place it
+  alongside this repository, or put it at `~/auto_eda`. If it isn't found,
+  step 3 logs a warning and is skipped; `--skip eda` does the same
+  explicitly. Every other step is unaffected.
 
 ## Citation
 

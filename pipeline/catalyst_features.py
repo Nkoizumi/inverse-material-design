@@ -124,33 +124,79 @@ def to_composition(cell: str, lookup_df: pd.DataFrame | None = None,
     return _resolve(s)
 
 
+@dataclass(frozen=True)
+class LookupIndex:
+    """Pre-resolved property lookup, keyed by the lookup's key column.
+
+    ``weighted_lookup`` used to re-scan the whole lookup DataFrame with a
+    boolean mask for every (row × property column × component) triple. On the
+    45-row metal table that is ~1.8 ms per catalyst row, so a 100k-row BO
+    library spent minutes doing nothing but repeated equality scans over 45
+    rows. Resolving each key once up front turns the inner loop into dict
+    lookups.
+
+    Semantics deliberately mirror the original scan:
+      * a key appearing more than once in the lookup is treated as ABSENT
+        (the old code required ``len(row) == 1``);
+      * NaN numeric cells are omitted, so they contribute neither value nor
+        weight to the weighted mean;
+      * categorical values are taken verbatim, NaN included.
+    """
+    numeric: dict[str, dict[str, float]]
+    categorical: dict[str, dict[str, object]]
+
+    @classmethod
+    def build(cls, lookup_df: pd.DataFrame, key_col: str,
+              numeric_cols: list[str], cat_cols: list[str]) -> "LookupIndex":
+        keys = lookup_df[key_col].astype(str)
+        counts = keys.value_counts()
+        unambiguous = set(counts[counts == 1].index)
+
+        numeric: dict[str, dict[str, float]] = {}
+        categorical: dict[str, dict[str, object]] = {}
+        for pos, key in enumerate(keys):
+            if key not in unambiguous:
+                continue
+            row = lookup_df.iloc[pos]
+            numeric[key] = {c: float(row[c]) for c in numeric_cols
+                            if not pd.isna(row[c])}
+            categorical[key] = {c: row[c] for c in cat_cols}
+        return cls(numeric=numeric, categorical=categorical)
+
+
 def weighted_lookup(components: dict[str, float], lookup_df: pd.DataFrame,
                     key_col: str, numeric_cols: list[str],
-                    cat_cols: list[str]) -> dict:
-    """Weighted average of numeric columns and major-component vote for categoricals."""
+                    cat_cols: list[str],
+                    index: LookupIndex | None = None) -> dict:
+    """Weighted average of numeric columns and major-component vote for categoricals.
+
+    Pass a prebuilt ``index`` when calling this in a loop — building one per
+    call defeats the point. Callers that only resolve a handful of rows (e.g.
+    step6's per-candidate enrichment) can omit it.
+    """
     if not components:
         return {}
 
-    feats = {}
+    if index is None:
+        index = LookupIndex.build(lookup_df, key_col, numeric_cols, cat_cols)
+
+    feats: dict = {}
     for nc in numeric_cols:
         val, total_w = 0.0, 0.0
         for k, w in components.items():
-            row = lookup_df[lookup_df[key_col].astype(str) == k]
-            if len(row) == 1 and not pd.isna(row[nc].iloc[0]):
-                val += w * float(row[nc].iloc[0])
+            entry = index.numeric.get(k)
+            if entry is not None and nc in entry:
+                val += w * entry[nc]
                 total_w += w
-        if total_w > 0:
-            feats[nc] = val / total_w
-        else:
-            feats[nc] = np.nan
+        feats[nc] = val / total_w if total_w > 0 else np.nan
 
-    for cc in cat_cols:
+    if cat_cols:
+        # `max` on ties picks the first key in insertion order — same as the
+        # original, which iterated the same `components` dict.
         major = max(components.items(), key=lambda kv: kv[1])[0]
-        row = lookup_df[lookup_df[key_col].astype(str) == major]
-        if len(row) == 1:
-            feats[cc] = row[cc].iloc[0]
-        else:
-            feats[cc] = np.nan
+        major_cats = index.categorical.get(major)
+        for cc in cat_cols:
+            feats[cc] = major_cats[cc] if major_cats is not None else np.nan
 
     return feats
 
@@ -255,10 +301,17 @@ class CatalystFeaturizer:
                         lookup: pd.DataFrame | None) -> pd.DataFrame:
         from matminer.featurizers.composition import ElementProperty, Stoichiometry
 
-        log.info("Matminer featurizing role '%s' (col='%s') …", prefix, col)
+        # Featurize DISTINCT cell values only, then broadcast back. A BO
+        # library is a Cartesian product, so a 100k-row library still has only
+        # ~11 distinct active metals and ~26 distinct supports — Magpie was
+        # being recomputed for each of the ~9k rows sharing a value.
+        cells = df[col].astype(str)
+        distinct = pd.Index(cells.unique())
+        log.info("Matminer featurizing role '%s' (col='%s') — %d distinct of "
+                 "%d rows.", prefix, col, len(distinct), len(df))
 
-        compositions = df[col].apply(lambda s: to_composition(s, lookup_df=lookup))
-        mask = compositions.notna()
+        comp_by_cell = {c: to_composition(c, lookup_df=lookup) for c in distinct}
+        mask = cells.map(lambda c: comp_by_cell[c] is not None)
 
         # Presence indicator (0 = role absent for this row, 1 = present).
         df = df.copy()
@@ -268,7 +321,9 @@ class CatalystFeaturizer:
             log.warning("No parseable compositions in '%s' — only presence flag added.", col)
             return df
 
-        temp = pd.DataFrame({"composition": compositions[mask].values}, index=df.index[mask])
+        parseable = [c for c in distinct if comp_by_cell[c] is not None]
+        temp = pd.DataFrame({"composition": [comp_by_cell[c] for c in parseable]},
+                            index=pd.Index(parseable, name=None))
 
         featurizers = [
             ElementProperty.from_preset(self.matminer_preset),
@@ -280,7 +335,13 @@ class CatalystFeaturizer:
         new_cols = [c for c in temp.columns if c != "composition"]
         rename = {c: f"{prefix}_{c}" for c in new_cols}
         temp = temp.rename(columns=rename)[list(rename.values())]
-        return df.join(temp, how="left")
+
+        # Broadcast the per-distinct-value rows back out. Cells whose
+        # composition failed to parse are absent from `temp`, so reindex gives
+        # them NaN — the same result the old per-row left-join produced.
+        expanded = temp.reindex(cells.values)
+        expanded.index = df.index
+        return df.join(expanded, how="left")
 
     def _join_lookup_weighted(self, df: pd.DataFrame, col: str,
                               lookup: pd.DataFrame, key_col: str, prefix: str,
@@ -297,11 +358,17 @@ class CatalystFeaturizer:
                     and not pd.api.types.is_numeric_dtype(lookup[c])]
         lookup_keys = set(lookup[key_col].astype(str))
 
-        feat_rows = []
-        for cell in df[col].astype(str):
-            components = parse_components(cell, lookup_keys)
-            feats = weighted_lookup(components, lookup, key_col, numeric_cols, cat_cols)
-            feat_rows.append(feats)
+        # Resolve the lookup once, then resolve each DISTINCT cell once. The
+        # old version re-parsed the cell with pymatgen and re-scanned the
+        # lookup DataFrame for every row.
+        index = LookupIndex.build(lookup, key_col, numeric_cols, cat_cols)
+        cells = df[col].astype(str)
+        feats_by_cell = {
+            cell: weighted_lookup(parse_components(cell, lookup_keys), lookup,
+                                  key_col, numeric_cols, cat_cols, index=index)
+            for cell in cells.unique()
+        }
+        feat_rows = [feats_by_cell[cell] for cell in cells]
 
         feat_df = pd.DataFrame(feat_rows, index=df.index)
         feat_df = feat_df.rename(columns={c: f"{prefix}_{c}" for c in feat_df.columns})
@@ -351,34 +418,32 @@ class CatalystFeaturizer:
         if not role_cols:
             return df
 
-        out_cols: dict[str, list] = {f"alloy_{c}": [] for c in ads_cols}
-        out_cols["alloy_dblock_frac"] = []
-        out_cols["is_alloy"] = []
+        # d-block fraction: use E_ads_C as the canonical "is d-block" probe
+        probe = "E_ads_C_eV" if "E_ads_C_eV" in ads_cols else ads_cols[0]
 
-        for _, row in df.iterrows():
+        def _compute(cells: tuple[tuple[str, str], ...]) -> dict:
+            """Alloy features for one (element, loading) combination."""
             moles: dict[str, float] = {}
-            for ecol, lcol in role_cols:
-                el = str(row[ecol]).strip()
+            for el_raw, load_raw in cells:
+                el = el_raw.strip()
                 if not el or el.lower() in ("nan", "none"):
                     continue
                 if el not in lookup:
                     continue
-                loading = pd.to_numeric(row[lcol], errors="coerce")
+                loading = pd.to_numeric(load_raw, errors="coerce")
                 if pd.isna(loading) or loading <= 0:
                     continue
                 moles[el] = float(loading) / lookup[el]["mass"]
 
             total = sum(moles.values())
             if total == 0:
-                for c in ads_cols:
-                    out_cols[f"alloy_{c}"].append(np.nan)
-                out_cols["alloy_dblock_frac"].append(np.nan)
-                out_cols["is_alloy"].append(0)
-                continue
+                res = {f"alloy_{c}": np.nan for c in ads_cols}
+                res["alloy_dblock_frac"] = np.nan
+                res["is_alloy"] = 0
+                return res
 
             x = {el: m / total for el, m in moles.items()}
-            out_cols["is_alloy"].append(int(len(x) > 1))
-
+            res = {"is_alloy": int(len(x) > 1)}
             for c in ads_cols:
                 num = 0.0
                 w_total = 0.0
@@ -387,15 +452,36 @@ class CatalystFeaturizer:
                     if not np.isnan(v):
                         num += frac * v
                         w_total += frac
-                out_cols[f"alloy_{c}"].append(num / w_total if w_total > 0 else np.nan)
+                res[f"alloy_{c}"] = num / w_total if w_total > 0 else np.nan
+            res["alloy_dblock_frac"] = sum(
+                frac for el, frac in x.items() if not np.isnan(lookup[el][probe])
+            )
+            return res
 
-            # d-block fraction: use E_ads_C as the canonical "is d-block" probe
-            probe = "E_ads_C_eV" if "E_ads_C_eV" in ads_cols else ads_cols[0]
-            dblock_x = sum(frac for el, frac in x.items() if not np.isnan(lookup[el][probe]))
-            out_cols["alloy_dblock_frac"].append(dblock_x)
+        # One computation per DISTINCT (element, loading) combination rather
+        # than per row — the loading grids are small, so a 100k-row library has
+        # only a few hundred distinct combinations. Keys are strings so that a
+        # NaN loading still hashes (NaN != NaN would otherwise never cache).
+        col_pairs = [(df[ecol].astype(str), df[lcol].astype(str))
+                     for ecol, lcol in role_cols]
+        row_keys = list(zip(*[tuple(zip(e, l)) for e, l in col_pairs]))
 
-        log.info("Added alloy-effective features (%d binding cols + dblock_frac + is_alloy).",
-                 len(ads_cols))
+        cache: dict[tuple, dict] = {}
+        rows = []
+        for key in row_keys:
+            res = cache.get(key)
+            if res is None:
+                res = cache[key] = _compute(key)
+            rows.append(res)
+
+        # Preserve the original column order: binding columns, then dblock, then
+        # is_alloy. Building from a list of dicts would order by first-seen key.
+        ordered = [f"alloy_{c}" for c in ads_cols] + ["alloy_dblock_frac", "is_alloy"]
+        out_cols = {name: [r[name] for r in rows] for name in ordered}
+
+        log.info("Added alloy-effective features (%d binding cols + dblock_frac + "
+                 "is_alloy) from %d distinct combinations across %d rows.",
+                 len(ads_cols), len(cache), len(df))
         return df.join(pd.DataFrame(out_cols, index=df.index), how="left")
 
     def _add_mixed_oxide_indicator(self, df: pd.DataFrame, support_col: str,
@@ -404,9 +490,12 @@ class CatalystFeaturizer:
             sup_lookup is not None and "support" in sup_lookup.columns
         ) else set()
         df = df.copy()
-        df["is_mixed_oxide"] = df[support_col].apply(
-            lambda s: int(len(parse_components(s, lookup_keys)) > 1)
-        )
+        # parse_components goes through pymatgen for anything that isn't a bare
+        # lookup key, so resolve each distinct support cell once.
+        cells = df[support_col].astype(str)
+        by_cell = {c: int(len(parse_components(c, lookup_keys)) > 1)
+                   for c in cells.unique()}
+        df["is_mixed_oxide"] = cells.map(by_cell).values
         return df
 
     def _add_interfacial(self, df: pd.DataFrame) -> pd.DataFrame:

@@ -14,18 +14,32 @@ Two modes, picked by ``config.CATALYST_MODE``:
 from __future__ import annotations
 
 import logging
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
 import torch
 
 import config
+from seeding import make_sampler, seed_everything
 from step4_surrogate import XYData
 
 log = logging.getLogger(__name__)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.double
+
+
+class Selection(NamedTuple):
+    """A BO batch plus the exact standardized features it was scored on.
+
+    Carrying X_std out of the `_run_*` functions is what lets the BNN
+    cross-check evaluate the same points the driver did. Re-deriving the
+    features from `candidates` is not equivalent — see
+    `_attach_bnn_predictions`.
+    """
+    candidates: pd.DataFrame
+    X_std: torch.Tensor
 
 
 def _get_signs(n_targets: int) -> torch.Tensor:
@@ -50,6 +64,12 @@ def _get_signs(n_targets: int) -> torch.Tensor:
 # ─────────────────────────────────────────────────────────────────────────────
 def run_inverse(df: pd.DataFrame, surrogates: dict,
                 transformer=None) -> pd.DataFrame:
+    # Re-seed at the top of step 5 rather than relying on whatever RNG state
+    # step 4 happened to leave behind: the amount of randomness step 4 consumes
+    # depends on CV_FOLDS and SURROGATE_KIND, so without this the BO batch
+    # would silently change when you toggle CV on or off.
+    seed_everything()
+
     data: XYData = surrogates["data"]
     # Driver priority: exact GP > SVGP > BNN. BNN cross-check kept for the
     # candidate report when GP is the driver and BNN is also fit (existing
@@ -65,53 +85,61 @@ def run_inverse(df: pd.DataFrame, surrogates: dict,
         raise RuntimeError("No surrogate available — fit one in step 4 first.")
 
     if getattr(config, "CATALYST_FRACTION_MODE", False):
-        out = _run_catalyst_fraction_discrete(df, data, surrogate)
+        selection = _run_catalyst_fraction_discrete(df, data, surrogate)
     elif config.CATALYST_MODE:
-        out = _run_catalyst_discrete(df, data, surrogate, transformer=transformer)
+        selection = _run_catalyst_discrete(df, data, surrogate, transformer=transformer)
     elif getattr(config, "STEELS_LIBRARY", False):
-        out = _run_steels_discrete(df, data, surrogate, transformer=transformer)
+        selection = _run_steels_discrete(df, data, surrogate, transformer=transformer)
     else:
-        out = _run_continuous(df, data, surrogate)
+        selection = _run_continuous(df, data, surrogate)
 
-    # If GP is driving and BNN is also fit, attach BNN predictions for the
-    # selected candidates so the report can show a GP-vs-BNN comparison.
-    # BNN cross-check is currently wired only for role-based catalyst mode
-    # (uses CatalystFeaturizer). Skip in atomic-fraction mode for now — the
-    # report's GP-vs-BNN scatter just won't render for those rows.
-    if gp is not None and bnn is not None and not getattr(
-        config, "CATALYST_FRACTION_MODE", False
-    ):
-        out = _attach_bnn_predictions(out, data, bnn)
-        out.to_parquet(config.DATA_DIR / "candidates.parquet")
-    elif surrogate is svgp and bnn is not None:
-        # SVGP driver + BNN cross-check: same parquet layout, so step6's
-        # GP-vs-BNN comparison plot still works (the "GP" axis is SVGP).
-        out = _attach_bnn_predictions(out, data, bnn)
+    out = selection.candidates
+
+    # If a BNN is also fit, attach its predictions for the selected candidates
+    # so the report can show a GP-vs-BNN comparison. Works in every mode: the
+    # cross-check now scores the SAME feature tensor the driver scored rather
+    # than re-deriving one from the displayed candidate table.
+    if bnn is not None and surrogate is not bnn:
+        out = _attach_bnn_predictions(out, data, bnn, selection.X_std)
         out.to_parquet(config.DATA_DIR / "candidates.parquet")
 
     return out
 
 
-def _attach_bnn_predictions(candidates_df: pd.DataFrame, data: XYData, bnn) -> pd.DataFrame:
-    """Re-featurize the selected candidates' standardized X and predict with BNN."""
-    from catalyst_features import CatalystFeaturizer
-    from catalyst_library import build_library  # noqa  (kept for parity if needed)
+def _attach_bnn_predictions(candidates_df: pd.DataFrame, data: XYData, bnn,
+                            X_std: torch.Tensor) -> pd.DataFrame:
+    """Score the BNN on the SAME standardized features the driver scored.
 
-    if not config.CATALYST_MODE:
-        log.info("BNN cross-check is only wired for catalyst mode; skipping.")
+    This used to re-featurize `candidates_df` with a fresh CatalystFeaturizer
+    and push the result through `_align_to_training`, which zero-fills any
+    column it can't find. That produced a systematically different input than
+    the one the GP saw, because the displayed candidate table carries only
+    composition — active_metal, promoters, support and loadings. Every
+    reaction condition (`reaction_temp_C`, `WHSV_h`, `H2_HC_ratio`, …) was
+    therefore zero-filled for the BNN and its `{col}_present` indicator set to
+    0, while step 2a had filled exactly those columns with the TRAINING MEDIAN
+    for the GP. Any Tab-2 transformer was skipped as well.
+
+    The Δ column in the report — which the LLM is told to cite as a
+    surrogate-confidence signal, and which `_build_agreement_summary` uses to
+    name the "safest GP-BNN-aligned pick" — was thus a mixture of genuine
+    model disagreement and a pure input artifact.
+
+    Using the driver's own tensor removes the artifact, and as a side effect
+    drops the CatalystFeaturizer dependency that restricted the cross-check to
+    role-based catalyst mode.
+    """
+    if X_std is None:
+        log.info("No feature tensor available for the selected candidates; "
+                 "skipping BNN cross-check.")
         return candidates_df
-
-    cf = CatalystFeaturizer(
-        roles=config.CATALYST_ROLES,
-        loadings=config.CATALYST_LOADINGS,
-        support_lookup_path=config.SUPPORT_LOOKUP_PATH,
-        metal_lookup_path=config.METAL_LOOKUP_PATH,
-        optional_numeric_features=getattr(config, "OPTIONAL_NUMERIC_FEATURES", []),
-    )
-    feat = cf.fit_transform(candidates_df)
-    X_raw = _align_to_training(feat, data.feature_cols)
-    X = torch.tensor(X_raw, dtype=DTYPE, device=DEVICE)
-    X_std = (X - data.x_mean) / data.x_std
+    if X_std.shape[0] != len(candidates_df):
+        log.warning(
+            "BNN cross-check skipped: %d feature rows for %d candidates. The "
+            "selection and its tensor must stay in lockstep.",
+            X_std.shape[0], len(candidates_df),
+        )
+        return candidates_df
 
     mean_std, sd_std = bnn.predict(X_std)
     pred_real = mean_std * data.y_std + data.y_mean
@@ -121,44 +149,180 @@ def _attach_bnn_predictions(candidates_df: pd.DataFrame, data: XYData, bnn) -> p
     for t, name in enumerate(data.target_cols):
         out[f"pred_{name}_bnn"] = pred_real[:, t].detach().cpu().numpy()
         out[f"pred_{name}_bnn_sd"] = pred_sd_real[:, t].detach().cpu().numpy()
-    log.info("Attached BNN cross-check predictions to %d candidates.", len(out))
+    log.info("Attached BNN cross-check predictions to %d candidates "
+             "(scored on the driver's own feature tensor).", len(out))
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared machinery
+#
+# The four `_run_*` paths differ only in how they build and featurize their
+# library. Everything after that — acquisition, discrete selection, row
+# recovery, prediction attachment — used to be copy-pasted per path, which is
+# how two alignment bugs came to exist in one copy each. Fix them here once.
+# ─────────────────────────────────────────────────────────────────────────────
+def _build_acquisition(surrogate, data: XYData, multi_objective: bool):
+    """qLogNEHVI for multi-objective, qLogNEI otherwise.
+
+    `signs` flips minimize-targets so every path can treat the problem as
+    maximization; the ref_point therefore lives in objective (post-flip) space.
+    """
+    signs = _get_signs(data.Y.shape[1])
+
+    if multi_objective:
+        from botorch.acquisition.multi_objective.logei import (
+            qLogNoisyExpectedHypervolumeImprovement,
+        )
+        from botorch.acquisition.multi_objective.objective import (
+            WeightedMCMultiOutputObjective,
+        )
+        # ref_point as a plain list, not a Tensor: BoTorch 0.18 accepts both,
+        # but the Tensor form has silently mis-handled MOBO in other versions.
+        ref = ((data.Y * signs).min(dim=0).values - 1.0).detach().cpu().tolist()
+        return qLogNoisyExpectedHypervolumeImprovement(
+            model=surrogate.model, X_baseline=data.X, ref_point=ref,
+            objective=WeightedMCMultiOutputObjective(weights=signs),
+            sampler=make_sampler(multi_objective=True),
+        )
+
+    from botorch.acquisition.logei import qLogNoisyExpectedImprovement
+    from botorch.acquisition.objective import ScalarizedPosteriorTransform
+    # signs * y is in standardized space; arg-max-of-(signs*y) ≡ min y when signs=-1.
+    return qLogNoisyExpectedImprovement(
+        model=surrogate.model, X_baseline=data.X,
+        posterior_transform=ScalarizedPosteriorTransform(weights=signs),
+        sampler=make_sampler(multi_objective=False),
+    )
+
+
+def _apply_transformer(library_feat: pd.DataFrame, transformer, label: str) -> pd.DataFrame:
+    """Apply (never re-fit) a Tab-2 sklearn transformer to a featurized library.
+
+    Missing columns the transformer was fit on are filled with 0; surplus
+    columns are dropped. On any failure the raw featurized library is returned
+    unchanged — a mis-transformed library is worse than an untransformed one.
+    """
+    if transformer is None:
+        return library_feat
+    try:
+        fit_cols = list(getattr(transformer, "feature_names_in_", []))
+        if not fit_cols:
+            return library_feat
+        lib_in = library_feat.reindex(columns=fit_cols, fill_value=0.0)
+        out = transformer.transform(lib_in)
+        # Use the full pipeline's get_feature_names_out — it threads names
+        # through every step including HighCorrelationRemover, so out_cols
+        # correctly reflects post-correlation-removal columns. Falling back to
+        # the preprocessor's names would over-count and zero-fill downstream.
+        try:
+            out_cols = list(transformer.get_feature_names_out())
+        except Exception:
+            try:
+                out_cols = list(
+                    transformer.named_steps["preprocessor"].get_feature_names_out()
+                )
+            except Exception:
+                out_cols = None
+        if isinstance(out, pd.DataFrame):
+            if out_cols is not None and len(out_cols) == out.shape[1]:
+                out.columns = out_cols
+            out.index = library_feat.index
+            result = out
+        else:
+            arr = np.asarray(out)
+            if out_cols is None or len(out_cols) != arr.shape[1]:
+                out_cols = [f"feat_{i}" for i in range(arr.shape[1])]
+            result = pd.DataFrame(arr, columns=out_cols, index=library_feat.index)
+        log.info("Applied Tab-2 transformer to %s library (%d → %d cols).",
+                 label, len(fit_cols), len(out_cols))
+        return result
+    except Exception as e:
+        log.warning("Tab-2 transformer apply on %s library failed (%s); "
+                    "falling back to raw featurized library.", label, e)
+        return library_feat
+
+
+def _standardize_library(library_feat: pd.DataFrame, data: XYData) -> torch.Tensor:
+    """Align a featurized library to the training columns and standardize it
+    with the training moments."""
+    X_lib = torch.tensor(_align_to_training(library_feat, data.feature_cols),
+                         dtype=DTYPE, device=DEVICE)
+    X_lib_std = (X_lib - data.x_mean) / data.x_std
+    log.info("Library tensor: %s. Training tensor: %s.",
+             tuple(X_lib_std.shape), tuple(data.X.shape))
+    return X_lib_std
+
+
+def _recover_library_rows(X_lib_std: torch.Tensor,
+                          candidates_std: torch.Tensor) -> list[int]:
+    """Map each selected point back to its library row by nearest neighbour.
+
+    optimize_acqf_discrete returns the chosen rows' VALUES, not their indices,
+    so they have to be located again. Ties are possible when the featurizer
+    produces numerically indistinguishable rows; argmin picks the first, which
+    the caller's identity dedup then collapses.
+    """
+    # cdist over the whole batch rather than a Python loop over candidates.
+    return torch.cdist(candidates_std, X_lib_std).argmin(dim=1).cpu().tolist()
+
+
+def _attach_predictions(selected: pd.DataFrame, sel_X: torch.Tensor,
+                        surrogate, data: XYData) -> pd.DataFrame:
+    """Attach the driver's mean / sd for the selected rows, in original Y units."""
+    mean_std, sd_std = surrogate.predict(sel_X)
+    pred_real = mean_std * data.y_std + data.y_mean
+    pred_sd_real = sd_std * data.y_std
+    for t, name in enumerate(data.target_cols):
+        selected[f"pred_{name}"] = pred_real[:, t].detach().cpu().numpy()
+        selected[f"pred_{name}_sd"] = pred_sd_real[:, t].detach().cpu().numpy()
+    return selected
+
+
+def _select_discrete(acq, X_lib_std: torch.Tensor, q: int) -> torch.Tensor:
+    """Run optimize_acqf_discrete, clamping q to the library size."""
+    from botorch.optim.optimize import optimize_acqf_discrete
+
+    candidates_std, _ = optimize_acqf_discrete(
+        acq_function=acq,
+        q=min(int(q), X_lib_std.shape[0]),
+        choices=X_lib_std,
+        unique=True,
+        max_batch_size=int(getattr(config, "BO_ACQ_BATCH_SIZE", 512)),
+    )
+    return candidates_std
+
+
+def _save_candidates(selected: pd.DataFrame, kind: str, library_size: int) -> None:
+    out_path = config.DATA_DIR / "candidates.parquet"
+    selected.to_parquet(out_path)
+    log.info("Selected %d %s candidates from library of %d.",
+             len(selected), kind, library_size)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Continuous (single-formula) path
 # ─────────────────────────────────────────────────────────────────────────────
-def _run_continuous(df: pd.DataFrame, data: XYData, surrogate) -> pd.DataFrame:
+def _run_continuous(df: pd.DataFrame, data: XYData, surrogate) -> Selection:
     multi_objective = data.Y.shape[1] > 1
     log.info("Continuous %s …", "MOBO (qLogNEHVI)" if multi_objective else "BO (qLogNEI)")
 
     candidates_std = _optimize_continuous(surrogate, data, multi_objective)
-    mean_std, sd_std = surrogate.predict(candidates_std)
-    pred_real = mean_std * data.y_std + data.y_mean
-    pred_sd_real = sd_std * data.y_std
-
     nearest = _nearest_known(candidates_std, data, df)
 
-    rows = []
-    for i in range(candidates_std.shape[0]):
-        row = {"candidate_idx": i, "nearest_material": nearest[i]}
-        for t, name in enumerate(data.target_cols):
-            row[f"pred_{name}"] = pred_real[i, t].item()
-            row[f"pred_{name}_sd"] = pred_sd_real[i, t].item()
-        rows.append(row)
-    out = pd.DataFrame(rows)
+    out = pd.DataFrame({
+        "candidate_idx": range(candidates_std.shape[0]),
+        "nearest_material": nearest,
+    })
+    out = _attach_predictions(out, candidates_std, surrogate, data)
 
     out_path = config.DATA_DIR / "candidates.parquet"
     out.to_parquet(out_path)
     log.info("Saved %d candidates to %s.", len(out), out_path)
-    return out
+    return Selection(out, candidates_std)
 
 
 def _optimize_continuous(surrogate, data: XYData, multi_objective: bool) -> torch.Tensor:
-    from botorch.acquisition.logei import qLogNoisyExpectedImprovement
-    from botorch.acquisition.multi_objective.logei import qLogNoisyExpectedHypervolumeImprovement
-    from botorch.acquisition.objective import ScalarizedPosteriorTransform
-    from botorch.acquisition.multi_objective.objective import WeightedMCMultiOutputObjective
     from botorch.optim import optimize_acqf
 
     d = data.X.shape[1]
@@ -167,37 +331,42 @@ def _optimize_continuous(surrogate, data: XYData, multi_objective: bool) -> torc
         torch.full((d,),  3.0, dtype=DTYPE, device=DEVICE),
     ])
 
-    signs = _get_signs(data.Y.shape[1])
-
-    if not multi_objective:
-        # signs * y is in standardized space; arg-max-of-(signs*y) ≡ min y when signs=-1.
-        acq = qLogNoisyExpectedImprovement(
-            model=surrogate.model, X_baseline=data.X,
-            posterior_transform=ScalarizedPosteriorTransform(weights=signs),
-        )
-    else:
-        objective = WeightedMCMultiOutputObjective(weights=signs)
-        # ref_point lives in objective (post-sign-flip) space.
-        ref = (data.Y * signs).min(dim=0).values - 1.0
-        acq = qLogNoisyExpectedHypervolumeImprovement(
-            model=surrogate.model, X_baseline=data.X, ref_point=ref,
-            objective=objective,
-        )
-
     candidates, _ = optimize_acqf(
-        acq_function=acq, bounds=bounds, q=config.BO_BATCH_SIZE,
+        acq_function=_build_acquisition(surrogate, data, multi_objective),
+        bounds=bounds, q=config.BO_BATCH_SIZE,
         num_restarts=10, raw_samples=256,
     )
     return candidates.detach()
 
 
 def _nearest_known(candidates: torch.Tensor, data: XYData, df: pd.DataFrame) -> list[str]:
+    """Nearest training material to each candidate, by standardized distance.
+
+    `data.X` indexes the rows that SURVIVED prepare_xy, which drops every row
+    with a NaN in any target. Indexing the full `df` with a `data.X` row index
+    therefore reported the wrong material whenever the dataset had a missing
+    target — silently, since both are valid formulas. Re-apply the same mask
+    here so the two line up.
+    """
+    aligned = df
+    targets = [t for t in data.target_cols if t in df.columns]
+    if targets:
+        aligned = df.loc[df[targets].notna().all(axis=1)].reset_index(drop=True)
+
+    if len(aligned) != data.X.shape[0]:
+        log.warning(
+            "Cannot align training rows to the surrogate's tensor (%d rows vs "
+            "%d) — reporting nearest material as '?'. prepare_xy must have "
+            "dropped rows for a reason this function does not model.",
+            len(aligned), data.X.shape[0],
+        )
+        return ["?"] * candidates.shape[0]
+
     formulas = (
-        df["composition_str"] if "composition_str" in df.columns
-        else df["composition"].astype(str)
+        aligned["composition_str"] if "composition_str" in aligned.columns
+        else aligned["composition"].astype(str)
     ).tolist()
-    distances = torch.cdist(candidates, data.X)
-    nearest_idx = distances.argmin(dim=1).cpu().tolist()
+    nearest_idx = torch.cdist(candidates, data.X).argmin(dim=1).cpu().tolist()
     return [formulas[i] for i in nearest_idx]
 
 
@@ -205,7 +374,7 @@ def _nearest_known(candidates: torch.Tensor, data: XYData, df: pd.DataFrame) -> 
 # Catalyst discrete path
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
-                            transformer=None) -> pd.DataFrame:
+                            transformer=None) -> Selection:
     from catalyst_features import CatalystFeaturizer
     from catalyst_library import build_library
 
@@ -260,77 +429,15 @@ def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
         log.info("Filled BO library with training-median conditions: %s",
                  ", ".join(fill_log))
 
-    # 2b. Optional Tab-2 transformer — apply (NOT re-fit) the same sklearn
-    # preprocessing to the library so its column space matches the training
-    # transformed df. Missing columns the transformer was fit on are filled
-    # with 0; surplus columns are dropped.
-    if transformer is not None:
-        try:
-            fit_cols = list(getattr(transformer, "feature_names_in_", []))
-            if fit_cols:
-                lib_in = library_feat.reindex(columns=fit_cols, fill_value=0.0)
-                out = transformer.transform(lib_in)
-                # Use the full pipeline's get_feature_names_out — it threads
-                # names through every step including HighCorrelationRemover,
-                # so out_cols correctly reflects post-correlation-removal
-                # columns. Falling back to the preprocessor's names would
-                # over-count and zero-fill downstream.
-                try:
-                    out_cols = list(transformer.get_feature_names_out())
-                except Exception:
-                    try:
-                        out_cols = list(
-                            transformer.named_steps["preprocessor"].get_feature_names_out()
-                        )
-                    except Exception:
-                        out_cols = None
-                if isinstance(out, pd.DataFrame):
-                    if out_cols is not None and len(out_cols) == out.shape[1]:
-                        out.columns = out_cols
-                    out.index = library_feat.index
-                    library_feat = out
-                else:
-                    arr = np.asarray(out)
-                    if out_cols is None or len(out_cols) != arr.shape[1]:
-                        out_cols = [f"feat_{i}" for i in range(arr.shape[1])]
-                    library_feat = pd.DataFrame(arr, columns=out_cols,
-                                                index=library_feat.index)
-                log.info("Applied Tab-2 transformer to BO library (%d → %d cols).",
-                         len(fit_cols), len(out_cols))
-        except Exception as e:
-            log.warning("Tab-2 transformer apply on library failed (%s); "
-                        "falling back to raw featurized library.", e)
+    # 2b. Optional Tab-2 transformer — apply (NOT re-fit) so the library's
+    # column space matches the training transformed df.
+    library_feat = _apply_transformer(library_feat, transformer, "BO")
 
     # 3. Align columns to training feature set --------------------------------
-    X_lib_raw = _align_to_training(library_feat, data.feature_cols)
-    X_lib = torch.tensor(X_lib_raw, dtype=DTYPE, device=DEVICE)
-    X_lib_std = (X_lib - data.x_mean) / data.x_std
-
-    log.info("Library tensor: %s. Training tensor: %s.",
-             tuple(X_lib_std.shape), tuple(data.X.shape))
+    X_lib_std = _standardize_library(library_feat, data)
 
     # 4. Build acquisition function -------------------------------------------
-    signs = _get_signs(data.Y.shape[1])
-    if multi_objective:
-        from botorch.acquisition.multi_objective.logei import (
-            qLogNoisyExpectedHypervolumeImprovement,
-        )
-        from botorch.acquisition.multi_objective.objective import (
-            WeightedMCMultiOutputObjective,
-        )
-        objective = WeightedMCMultiOutputObjective(weights=signs)
-        ref = (data.Y * signs).min(dim=0).values - 1.0
-        acq = qLogNoisyExpectedHypervolumeImprovement(
-            model=surrogate.model, X_baseline=data.X, ref_point=ref,
-            objective=objective,
-        )
-    else:
-        from botorch.acquisition.logei import qLogNoisyExpectedImprovement
-        from botorch.acquisition.objective import ScalarizedPosteriorTransform
-        acq = qLogNoisyExpectedImprovement(
-            model=surrogate.model, X_baseline=data.X,
-            posterior_transform=ScalarizedPosteriorTransform(weights=signs),
-        )
+    acq = _build_acquisition(surrogate, data, multi_objective)
 
     # 5. Discrete acquisition -------------------------------------------------
     # Over-fetch by BO_UNIQUE_OVERSAMPLE so we still hit BO_BATCH_SIZE after
@@ -342,22 +449,10 @@ def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
     q_target = int(config.BO_BATCH_SIZE)
     oversample = int(getattr(config, "BO_UNIQUE_OVERSAMPLE", 4))
     q_ask = min(q_target * oversample, X_lib_std.shape[0])
-
-    from botorch.optim.optimize import optimize_acqf_discrete
-
-    candidates_std, _ = optimize_acqf_discrete(
-        acq_function=acq,
-        q=q_ask,
-        choices=X_lib_std,
-        unique=True,
-        max_batch_size=int(getattr(config, "BO_ACQ_BATCH_SIZE", 512)),
-    )
+    candidates_std = _select_discrete(acq, X_lib_std, q_ask)
 
     # 6. Recover library rows for selected candidates -------------------------
-    selected_idx = []
-    for c in candidates_std:
-        diffs = (X_lib_std - c).pow(2).sum(dim=1)
-        selected_idx.append(int(diffs.argmin().item()))
+    selected_idx = _recover_library_rows(X_lib_std, candidates_std)
 
     # 6a. Dedup on displayed catalyst identity, cap at q_target.
     id_cols = [c for c in
@@ -386,25 +481,15 @@ def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
 
     selected = library_raw.iloc[selected_idx].reset_index(drop=True)
 
-    # 7. Attach predictions --------------------------------------------------
+    # 7. Attach predictions + save -------------------------------------------
     sel_X = X_lib_std[selected_idx]
-    mean_std, sd_std = surrogate.predict(sel_X)
-    pred_real = mean_std * data.y_std + data.y_mean
-    pred_sd_real = sd_std * data.y_std
-    for t, name in enumerate(data.target_cols):
-        selected[f"pred_{name}"] = pred_real[:, t].detach().cpu().numpy()
-        selected[f"pred_{name}_sd"] = pred_sd_real[:, t].detach().cpu().numpy()
-
-    # 8. Save ----------------------------------------------------------------
-    out_path = config.DATA_DIR / "candidates.parquet"
-    selected.to_parquet(out_path)
-    log.info("Selected %d catalyst candidates from library of %d.",
-             len(selected), len(library_raw))
-    return selected
+    selected = _attach_predictions(selected, sel_X, surrogate, data)
+    _save_candidates(selected, "catalyst", len(library_raw))
+    return Selection(selected, sel_X)
 
 
 def _run_catalyst_fraction_discrete(df: pd.DataFrame, data: XYData,
-                                     surrogate) -> pd.DataFrame:
+                                     surrogate) -> Selection:
     """Discrete BO over an empirical atomic-fraction catalyst library.
 
     Companion to `_run_catalyst_discrete` (role-based path). Same acquisition
@@ -446,38 +531,12 @@ def _run_catalyst_fraction_discrete(df: pd.DataFrame, data: XYData,
     )
 
     # 3. Align columns to training feature set --------------------------------
-    X_lib_raw = _align_to_training(library_feat, data.feature_cols)
-    X_lib = torch.tensor(X_lib_raw, dtype=DTYPE, device=DEVICE)
-    X_lib_std = (X_lib - data.x_mean) / data.x_std
-
-    log.info("Library tensor: %s. Training tensor: %s.",
-             tuple(X_lib_std.shape), tuple(data.X.shape))
+    X_lib_std = _standardize_library(library_feat, data)
 
     # 4. Build acquisition function -------------------------------------------
-    signs = _get_signs(data.Y.shape[1])
-    if multi_objective:
-        from botorch.acquisition.multi_objective.logei import (
-            qLogNoisyExpectedHypervolumeImprovement,
-        )
-        from botorch.acquisition.multi_objective.objective import (
-            WeightedMCMultiOutputObjective,
-        )
-        objective = WeightedMCMultiOutputObjective(weights=signs)
-        ref = (data.Y * signs).min(dim=0).values - 1.0
-        acq = qLogNoisyExpectedHypervolumeImprovement(
-            model=surrogate.model, X_baseline=data.X, ref_point=ref,
-            objective=objective,
-        )
-    else:
-        from botorch.acquisition.logei import qLogNoisyExpectedImprovement
-        from botorch.acquisition.objective import ScalarizedPosteriorTransform
-        acq = qLogNoisyExpectedImprovement(
-            model=surrogate.model, X_baseline=data.X,
-            posterior_transform=ScalarizedPosteriorTransform(weights=signs),
-        )
+    acq = _build_acquisition(surrogate, data, multi_objective)
 
     # 5. Discrete acquisition -------------------------------------------------
-    from botorch.optim.optimize import optimize_acqf_discrete
     family_cap = getattr(config, "BO_MAX_PER_FAMILY", None) or 0
     q_target = int(config.BO_BATCH_SIZE)
     if family_cap:
@@ -485,19 +544,10 @@ def _run_catalyst_fraction_discrete(df: pd.DataFrame, data: XYData,
         q_fetch = min(q_target * oversample, X_lib_std.shape[0])
     else:
         q_fetch = q_target
-    candidates_std, _ = optimize_acqf_discrete(
-        acq_function=acq,
-        q=q_fetch,
-        choices=X_lib_std,
-        unique=True,
-        max_batch_size=int(getattr(config, "BO_ACQ_BATCH_SIZE", 512)),
-    )
+    candidates_std = _select_discrete(acq, X_lib_std, q_fetch)
 
     # 6. Recover library rows for selected candidates -------------------------
-    ordered_idx = []
-    for c in candidates_std:
-        diffs = (X_lib_std - c).pow(2).sum(dim=1)
-        ordered_idx.append(int(diffs.argmin().item()))
+    ordered_idx = _recover_library_rows(X_lib_std, candidates_std)
 
     # 6a. Family-diversity cap (optional). Family = dominant non-support
     # element (fraction > 0.005). Greedy in acquisition order.
@@ -543,25 +593,15 @@ def _run_catalyst_fraction_discrete(df: pd.DataFrame, data: XYData,
 
     selected = library_raw.iloc[selected_idx].reset_index(drop=True)
 
-    # 7. Attach predictions ---------------------------------------------------
+    # 7. Attach predictions + save -------------------------------------------
     sel_X = X_lib_std[selected_idx]
-    mean_std, sd_std = surrogate.predict(sel_X)
-    pred_real = mean_std * data.y_std + data.y_mean
-    pred_sd_real = sd_std * data.y_std
-    for t, name in enumerate(data.target_cols):
-        selected[f"pred_{name}"] = pred_real[:, t].detach().cpu().numpy()
-        selected[f"pred_{name}_sd"] = pred_sd_real[:, t].detach().cpu().numpy()
-
-    # 8. Save ----------------------------------------------------------------
-    out_path = config.DATA_DIR / "candidates.parquet"
-    selected.to_parquet(out_path)
-    log.info("Selected %d catalyst candidates from library of %d.",
-             len(selected), len(library_raw))
-    return selected
+    selected = _attach_predictions(selected, sel_X, surrogate, data)
+    _save_candidates(selected, "catalyst", len(library_raw))
+    return Selection(selected, sel_X)
 
 
 def _run_steels_discrete(df: pd.DataFrame, data: XYData, surrogate,
-                          transformer=None) -> pd.DataFrame:
+                          transformer=None) -> Selection:
     """Discrete BO over a random Fe-balanced steel library. Same acquisition
     plumbing as the catalyst path; differences are the library builder and the
     matminer single-formula featurizer (Magpie + Stoichiometry)."""
@@ -585,109 +625,37 @@ def _run_steels_discrete(df: pd.DataFrame, data: XYData, surrogate,
     feature_cols_lib = [c for c in work.columns
                         if c not in ("composition", "composition_str")]
     before = len(work)
-    work = work.dropna(subset=feature_cols_lib).reset_index(drop=True)
+    # Select the surviving rows by POSITION and apply the same mask to both
+    # frames. The previous version read `work.index` *after*
+    # `reset_index(drop=True)`, which yields 0..n-1 and therefore selected the
+    # first n rows of library_raw rather than the rows that actually survived
+    # — silently pairing each candidate's composition string with a different
+    # candidate's features and predictions.
+    kept_pos = np.flatnonzero(work[feature_cols_lib].notna().all(axis=1).values)
+    work = work.iloc[kept_pos].reset_index(drop=True)
     if before != len(work):
         log.info("Dropped %d library rows that failed featurization.", before - len(work))
-    library_raw = library_raw.iloc[work.index.tolist()].reset_index(drop=True)
+    library_raw = library_raw.iloc[kept_pos].reset_index(drop=True)
     library_feat = work.drop(columns=["composition"])
 
     # 2. Optional Tab-2 transformer — apply (NOT re-fit) so library matches
     # the surrogate's training column space.
-    if transformer is not None:
-        try:
-            fit_cols = list(getattr(transformer, "feature_names_in_", []))
-            if fit_cols:
-                lib_in = library_feat.reindex(columns=fit_cols, fill_value=0.0)
-                out = transformer.transform(lib_in)
-                # Use the full pipeline's get_feature_names_out — it threads
-                # names through every step including HighCorrelationRemover,
-                # so out_cols correctly reflects post-correlation-removal
-                # columns. Falling back to the preprocessor's names would
-                # over-count and zero-fill downstream.
-                try:
-                    out_cols = list(transformer.get_feature_names_out())
-                except Exception:
-                    try:
-                        out_cols = list(
-                            transformer.named_steps["preprocessor"].get_feature_names_out()
-                        )
-                    except Exception:
-                        out_cols = None
-                if isinstance(out, pd.DataFrame):
-                    if out_cols is not None and len(out_cols) == out.shape[1]:
-                        out.columns = out_cols
-                    out.index = library_feat.index
-                    library_feat = out
-                else:
-                    arr = np.asarray(out)
-                    if out_cols is None or len(out_cols) != arr.shape[1]:
-                        out_cols = [f"feat_{i}" for i in range(arr.shape[1])]
-                    library_feat = pd.DataFrame(arr, columns=out_cols,
-                                                index=library_feat.index)
-                log.info("Applied Tab-2 transformer to steels library "
-                         "(%d → %d cols).", len(fit_cols), len(out_cols))
-        except Exception as e:
-            log.warning("Tab-2 transformer apply on steels library failed (%s); "
-                        "falling back to raw featurized library.", e)
+    library_feat = _apply_transformer(library_feat, transformer, "steels")
 
     # 3. Align to surrogate's training feature columns + standardize.
-    X_lib_raw = _align_to_training(library_feat, data.feature_cols)
-    X_lib = torch.tensor(X_lib_raw, dtype=DTYPE, device=DEVICE)
-    X_lib_std = (X_lib - data.x_mean) / data.x_std
+    X_lib_std = _standardize_library(library_feat, data)
 
-    log.info("Library tensor: %s. Training tensor: %s.",
-             tuple(X_lib_std.shape), tuple(data.X.shape))
-
-    # 4. Acquisition (mirror the catalyst path — signs handle min/max).
-    signs = _get_signs(data.Y.shape[1])
-    if multi_objective:
-        from botorch.acquisition.multi_objective.logei import (
-            qLogNoisyExpectedHypervolumeImprovement,
-        )
-        from botorch.acquisition.multi_objective.objective import (
-            WeightedMCMultiOutputObjective,
-        )
-        objective = WeightedMCMultiOutputObjective(weights=signs)
-        ref = (data.Y * signs).min(dim=0).values - 1.0
-        acq = qLogNoisyExpectedHypervolumeImprovement(
-            model=surrogate.model, X_baseline=data.X, ref_point=ref,
-            objective=objective,
-        )
-    else:
-        from botorch.acquisition.logei import qLogNoisyExpectedImprovement
-        from botorch.acquisition.objective import ScalarizedPosteriorTransform
-        acq = qLogNoisyExpectedImprovement(
-            model=surrogate.model, X_baseline=data.X,
-            posterior_transform=ScalarizedPosteriorTransform(weights=signs),
-        )
-
-    from botorch.optim.optimize import optimize_acqf_discrete
-    candidates_std, _ = optimize_acqf_discrete(
-        acq_function=acq, q=config.BO_BATCH_SIZE,
-        choices=X_lib_std, unique=True,
-        max_batch_size=int(getattr(config, "BO_ACQ_BATCH_SIZE", 512)),
-    )
+    # 4. Acquisition (signs handle min/max).
+    acq = _build_acquisition(surrogate, data, multi_objective)
+    candidates_std = _select_discrete(acq, X_lib_std, config.BO_BATCH_SIZE)
 
     # 5. Recover library rows + attach predictions.
-    selected_idx = []
-    for c in candidates_std:
-        diffs = (X_lib_std - c).pow(2).sum(dim=1)
-        selected_idx.append(int(diffs.argmin().item()))
-
+    selected_idx = _recover_library_rows(X_lib_std, candidates_std)
     selected = library_raw.iloc[selected_idx][["composition_str"]].reset_index(drop=True)
     sel_X = X_lib_std[selected_idx]
-    mean_std, sd_std = surrogate.predict(sel_X)
-    pred_real = mean_std * data.y_std + data.y_mean
-    pred_sd_real = sd_std * data.y_std
-    for t, name in enumerate(data.target_cols):
-        selected[f"pred_{name}"] = pred_real[:, t].detach().cpu().numpy()
-        selected[f"pred_{name}_sd"] = pred_sd_real[:, t].detach().cpu().numpy()
-
-    out_path = config.DATA_DIR / "candidates.parquet"
-    selected.to_parquet(out_path)
-    log.info("Selected %d steel candidates from library of %d.",
-             len(selected), len(library_raw))
-    return selected
+    selected = _attach_predictions(selected, sel_X, surrogate, data)
+    _save_candidates(selected, "steel", len(library_raw))
+    return Selection(selected, sel_X)
 
 
 def _align_to_training(library_feat: pd.DataFrame, training_feature_cols: list[str]) -> np.ndarray:
