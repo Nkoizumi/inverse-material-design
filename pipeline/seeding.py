@@ -14,7 +14,24 @@ builders. Three unseeded sources remained:
 
 Measured before this module existed: two back-to-back runs of
 ``--preset acs_pdh`` (gp only, 3k-row library) shared only 9 of 20 selected
-catalysts. See ``tests/test_reproducibility.py``.
+catalysts. After it: 20 of 20. See ``tests/test_reproducibility.py``.
+
+Determinism also holds ACROSS DEVICES, which is not automatic — CUDA and CPU
+kernels reduce in different orders, and the acquisition ranking could in
+principle diverge on the resulting float differences. Checked on the same
+``acs_pdh`` configuration:
+
+    CPU  (torch 2.12.1+cpu)    ┐
+                              ├─ identical batch, 20 of 20 catalysts
+    CUDA (torch 2.12.1+cu130) ┘
+
+That matters because development here happens on a GPU workstation while CI
+runs CPU-only on a hosted runner (see ``.github/workflows/tests.yml``, which
+installs the ``+cpu`` wheel deliberately): a candidate list generated locally
+is the one CI would generate. Re-check this if the acquisition function, the
+sampler, or the BoTorch pin changes — it is an empirical result about the
+current stack, not a guarantee BoTorch makes. There is no automated test for
+it, since it needs two hardware configurations.
 
 ``seed_everything`` is called at the top of ``step4_surrogate.fit_surrogates``
 and ``step5_inverse.run_inverse`` so both the CLI driver and the web UI get
