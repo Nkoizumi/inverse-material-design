@@ -100,6 +100,49 @@ def test_loading_for_an_undeclared_role_is_rejected():
     assert any("never read" in p for p in problems)
 
 
+# ── raw-vs-renamed targets ───────────────────────────────────────────────────
+def test_raw_header_target_is_named_precisely_not_as_a_leak():
+    """A target given in its pre-rename form used to be reported as a
+    TARGET_TWINS leak, which sent a user looking in entirely the wrong place.
+    The real fault is that the column will not exist after step 1."""
+    problems = validate(_cfg(
+        CATALYST_FRACTION_MODE=True,
+        CATALYST_FRACTION_ELEMENTS=["Al"],
+        CATALYST_FRACTION_SUPPORT_CATIONS=[],
+        CATALYST_FRACTION_RENAME={"propylene yield": "propylene_yield"},
+        TARGET_COLS=["propylene yield"], OPTIMIZATION_DIRECTIONS=["max"],
+        TARGET_TWINS={"propylene_yield"},
+    ))
+    assert any("RAW CSV header names" in p for p in problems)
+    assert any("propylene_yield" in p for p in problems)
+    # and it must NOT also be reported as a leak — that was the misleading part
+    assert not any("TARGET_TWINS" in p for p in problems)
+
+
+def test_rate_h_target_points_at_the_log_form():
+    problems = validate(_cfg(
+        CATALYST_FRACTION_MODE=True,
+        CATALYST_FRACTION_ELEMENTS=["Al"],
+        CATALYST_FRACTION_SUPPORT_CATIONS=[],
+        CATALYST_FRACTION_RENAME={"deactivation rate constant [h-1]": "deactivation_rate_h"},
+        TARGET_COLS=["deactivation rate constant [h-1]"],
+        OPTIMIZATION_DIRECTIONS=["min"],
+        TARGET_TWINS={"deactivation_rate_h"},
+    ))
+    assert any("deactivation_rate_log" in p for p in problems)
+
+
+def test_renamed_targets_validate_clean():
+    assert validate(_cfg(
+        CATALYST_FRACTION_MODE=True,
+        CATALYST_FRACTION_ELEMENTS=["Al"],
+        CATALYST_FRACTION_SUPPORT_CATIONS=[],
+        CATALYST_FRACTION_RENAME={"propylene yield": "propylene_yield"},
+        TARGET_COLS=["propylene_yield"], OPTIMIZATION_DIRECTIONS=["max"],
+        TARGET_TWINS={"propylene_yield"},
+    )) == []
+
+
 # ── the target-leak guard, enforced at runtime rather than only in tests ─────
 def test_target_missing_from_twins_is_rejected():
     problems = validate(_cfg(CATALYST_MODE=True,

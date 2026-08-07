@@ -196,12 +196,32 @@ def validate(cfg) -> list[str]:
                 f"CATALYST_ROLES; those loadings are never read."
             )
 
-    # ── 4. The target-leak guard ─────────────────────────────────────────────
+    # ── 4a. Targets named before step 1 renames them ─────────────────────────
+    # step1_load rewrites an atomic-fraction CSV's headers to snake_case before
+    # anything else sees the frame. A target given in its RAW form does not
+    # exist afterwards, and step 1 dies with a KeyError. That is a different
+    # fault from the leak rule below, and reporting it as a leak sent at least
+    # one user looking in entirely the wrong place — so name it precisely and
+    # exclude those targets from the leak check.
+    rename = _get(cfg, "CATALYST_FRACTION_RENAME") or {}
+    pre_rename = [t for t in targets if t in rename]
+    if pre_rename:
+        mapping = ", ".join(f"{t!r} → {rename[t]!r}" for t in pre_rename)
+        problems.append(
+            f"target(s) {pre_rename} are RAW CSV header names. step 1 renames "
+            f"them ({mapping}), so the name you gave does not exist by the time "
+            f"the surrogate is fitted. Select the renamed form instead."
+            + (" Note 'deactivation_rate_h' is further derived into "
+               "'deactivation_rate_log', which is the form the presets optimize."
+               if any(rename[t].endswith("_rate_h") for t in pre_rename) else "")
+        )
+
+    # ── 4b. The target-leak guard ────────────────────────────────────────────
     # prepare_xy drops TARGET_TWINS by name. A target missing from that set is
     # a feature column for any OTHER configuration run against the same CSV.
     twins = _get(cfg, "TARGET_TWINS") or set()
     if (role or fraction) and twins:
-        unguarded = [t for t in targets if t not in twins]
+        unguarded = [t for t in targets if t not in twins and t not in rename]
         if unguarded:
             problems.append(
                 f"target(s) {unguarded} are not in TARGET_TWINS. Any run that "

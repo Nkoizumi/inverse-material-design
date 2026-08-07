@@ -430,6 +430,73 @@ def test_cap_note_says_columns_are_hidden():
     assert "not evidence there is none" in note
 
 
+# ── the target picker must offer names the PIPELINE will see ─────────────────
+# step1_load renames an atomic-fraction CSV's headers before anything else
+# touches the frame. Tab 1 used to list the RAW headers, so every target a user
+# could pick from an ACS-style CSV ceased to exist one step later and step 1
+# died with `KeyError: Targets [...] not in columns`. W9 restricted the picker
+# to numeric columns but was only ever exercised against the synthetic dataset,
+# where nothing is renamed — so this case went unnoticed.
+FRACTION_HEADERS = [
+    "index", "rxn_id", "cat_id", "Al", "Ga", "Mg", "Mo", "Pt", "Sn", "Si", "Zr",
+    "calcination temperature [K]", "reaction temperature [K]",
+    "propylene yield", "deactivation rate constant [h-1]", "score",
+]
+
+
+def _fraction_csv(tmp_path):
+    import numpy as np
+    rng = np.random.default_rng(0)
+    data = {c: rng.random(12) for c in FRACTION_HEADERS}
+    p = tmp_path / "frac.csv"
+    pd.DataFrame(data).to_csv(p, index=False)
+    return p
+
+
+def _choices(update):
+    return update["choices"] if isinstance(update, dict) else update.constructor_args["choices"]
+
+
+def test_picker_offers_renamed_not_raw_headers(tmp_path):
+    class _F:
+        name = str(_fraction_csv(tmp_path))
+
+    opts = _choices(app.load_csv(_F(), use_synthetic=False)[1])
+    assert "propylene_yield" in opts
+    assert "propylene yield" not in opts, (
+        "raw header offered; step 1 renames it and the run dies with a KeyError"
+    )
+    assert "deactivation rate constant [h-1]" not in opts
+
+
+def test_picker_exposes_the_derived_log_target(tmp_path):
+    """_add_log_derived_targets looks for the RENAMED column, so before the fix
+    it found nothing and deactivation_rate_log never reached the picker — the
+    very target the acs_pdh preset optimizes."""
+    class _F:
+        name = str(_fraction_csv(tmp_path))
+
+    opts = _choices(app.load_csv(_F(), use_synthetic=False)[1])
+    assert "deactivation_rate_log" in opts
+
+
+def test_picker_drops_identifier_and_leaking_columns(tmp_path):
+    """step1's normalization also removes the dataset ids and `score`, the
+    paper's scalarization of the targets. None should be selectable."""
+    class _F:
+        name = str(_fraction_csv(tmp_path))
+
+    opts = _choices(app.load_csv(_F(), use_synthetic=False)[1])
+    for col in ("index", "rxn_id", "cat_id", "score"):
+        assert col not in opts, f"{col} is selectable as a target"
+
+
+def test_role_schema_picker_is_unaffected():
+    """The rename only applies to fraction schemas; role CSVs must be untouched."""
+    opts = _choices(app.load_csv(None, use_synthetic=True)[1])
+    assert "propane_TOF_log" in opts
+
+
 # ── W9: only numeric columns may be offered as targets ───────────────────────
 def test_target_choices_exclude_non_numeric_columns():
     """A text column picked as a target failed minutes later inside prepare_xy
