@@ -52,7 +52,28 @@ python webui/app.py
 ```
 
 Result: report + top-20 candidate table + interactive Pareto/parity/heatmap
-figures. ~7 min end-to-end including the LLM narrative.
+figures.
+
+**Runtime depends heavily on whether you have a CUDA GPU.** `step5_inverse`
+runs on CUDA when torch reports it available, and step 5 dominates everything
+else. Steps 1, 2 and 4 finish in under a minute either way. Measured on this
+preset with `--skip eda report`:
+
+| | steps 1–5 |
+|---|---|
+| CUDA GPU (workstation) | ~2 min |
+| CPU only (2-core CI runner) | **~21 min**, of which step 5 is 20 min (96%) |
+
+Step 6's LLM narrative adds several minutes on top of both, depending on your
+Ollama model and hardware.
+
+The cost is `optimize_acqf_discrete` scoring an ~8k-row library at
+q = `BO_BATCH_SIZE` × `BO_UNIQUE_OVERSAMPLE` = 80. If you are CPU-bound and
+want a faster demo, lower `BO_UNIQUE_OVERSAMPLE` — it over-fetches so duplicate
+catalyst identities can be dropped, so lowering it trades batch diversity for
+speed — or shrink the library lists in `config.py`. The `quickstart` job in
+`.github/workflows/tests.yml` runs this command on CPU if you want to
+re-measure.
 
 ### 2. matbench_steels — Reproducible benchmark
 
