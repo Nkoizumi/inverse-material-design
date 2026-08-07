@@ -23,29 +23,17 @@ def run_eda(df: pd.DataFrame) -> dict:
         log.info("AUTO_EDA_AVAILABLE=False; skipping step 3.")
         return {}
 
-    # The Orchestrator lives in a separate project (see config.AUTO_EDA_PATH
-    # for the resolution order). It used to be a hardcoded absolute path into
-    # the author's home directory, so step 3 could never run on anyone else's
-    # machine. Absence is not an error — the pipeline is fully usable without
+    # The Orchestrator lives in a separate project. auto_eda_bridge owns the
+    # path resolution and scopes the sys.path change to the import itself, so
+    # the other project does not stay ahead of this one for the rest of the
+    # process. Absence is not an error — the pipeline is fully usable without
     # auto-EDA, which is what `--skip eda` does explicitly.
-    auto_eda_path: Path | None = getattr(config, "AUTO_EDA_PATH", None)
-    if auto_eda_path is None:
-        log.warning(
-            "auto-EDA project not found; skipping step 3. Set "
-            "INVERSE_DESIGN_AUTO_EDA_PATH to a checkout of "
-            "github.com/Nkoizumi/llm-eda-mobo, place one alongside this "
-            "repository, or run with `--skip eda`."
-        )
-        return {}
-
-    if str(auto_eda_path) not in sys.path:
-        sys.path.insert(0, str(auto_eda_path))
+    from auto_eda_bridge import AutoEDAUnavailable, load as _load_auto_eda
 
     try:
-        from pipeline.orchestrator import Orchestrator  # noqa: E402
-    except Exception as e:
-        log.warning("Could not import auto_eda Orchestrator from %s (%s); "
-                    "skipping EDA.", auto_eda_path, e)
+        Orchestrator = _load_auto_eda("Orchestrator")
+    except AutoEDAUnavailable as e:
+        log.warning("Skipping step 3: %s", e)
         return {}
 
     # Auto-EDA takes a single target. For dual-target runs we EDA the primary one
