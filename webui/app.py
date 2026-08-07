@@ -160,18 +160,31 @@ def load_csv(file_obj, use_synthetic: bool):
     if df.empty or df.shape[1] == 0:
         return _load_csv_failure(f"`{source}` parsed as an empty table.")
 
-    # Auto-derive log-scale versions of wide-dynamic-range targets (e.g.
-    # deactivation_rate_h → deactivation_rate_log) so they show up in the
-    # target-column picker. Same logic step1_load uses on the canonical load
-    # path; mirroring it here keeps Tab 1's dropdown in sync.
+    schema = detect_schema(df.columns)
+
+    # Present the columns the PIPELINE will see, not the raw headers.
+    #
+    # step1_load renames an atomic-fraction CSV's headers before anything else
+    # touches it ('propylene yield' -> 'propylene_yield', 'deactivation rate
+    # constant [h-1]' -> 'deactivation_rate_h'), then derives the _log form.
+    # Offering the raw names here meant every target a user could pick from an
+    # ACS-style CSV ceased to exist one step later, and step 1 died with
+    # `KeyError: Targets [...] not in columns`. It also meant
+    # _add_log_derived_targets found nothing to work on, so deactivation_rate_log
+    # never appeared in the picker at all.
+    #
+    # Both transforms are imported from step1_load rather than reimplemented,
+    # so the picker cannot drift from the loader.
     try:
         # Webui convention: import step modules directly, not via
         # `pipeline.` package prefix (avoids namespace clash with auto_eda's
         # `pipeline` package).
-        from step1_load import _add_log_derived_targets
+        from step1_load import _add_log_derived_targets, _normalize_atomic_fraction_csv
+        if schema == "fraction":
+            df = _normalize_atomic_fraction_csv(df)
         df = _add_log_derived_targets(df)
     except Exception as e:
-        log.warning("Log-derived target generation skipped (%s).", e)
+        log.warning("Column normalization for the target picker skipped (%s).", e)
 
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     # Prefer one of the pipeline-configured targets if it's present, otherwise
@@ -184,7 +197,8 @@ def load_csv(file_obj, use_synthetic: bool):
     if target_default is None and numeric_cols:
         target_default = numeric_cols[0]
 
-    schema = detect_schema(df.columns)
+    # `schema` was determined above, before the rename — the element columns a
+    # fraction CSV is detected by are not renamed, so it is the same either way.
     msg = (
         f"Loaded **{source}** — {len(df)} rows × {df.shape[1]} columns.  \n"
         f"Detected schema: **{_SCHEMA_LABEL[schema]}**.  \n"
