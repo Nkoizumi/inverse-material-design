@@ -5,8 +5,21 @@
 # Core scientific stack
 numpy==1.26.4
 pandas==2.3.3
-scipy==1.16.3
+# scipy>=1.17.0 is required by matminer 0.10.1. This file previously pinned
+# 1.16.3, which pip cannot resolve — `pip install -r requirements.txt` failed
+# outright on a clean environment even though the author's conda env ran fine
+# (conda installed scipy without enforcing matminer's pip metadata). 1.17.1
+# needs numpy>=1.26.4,<2.7, which the numpy pin above satisfies exactly; 1.18
+# would force numpy>=2.0 and break it.
+scipy==1.17.1
 scikit-learn==1.8.0
+# Parquet engine for pandas. Every pipeline stage caches through .parquet
+# (raw, featurized, candidates, both parity files — 18 call sites), so this is
+# a hard runtime dependency, not an optional accelerator. It was never
+# declared: it happened to be present in the author's conda env as a
+# transitive dependency, so step 1 failed at the first `to_parquet` for anyone
+# installing from this file.
+pyarrow==24.0.0
 
 # Plotting
 matplotlib==3.10.0
