@@ -141,37 +141,127 @@ def run_eda(df: pd.DataFrame) -> dict:
     return results
 
 
-def _feature_importances_per_target(work: pd.DataFrame, feature_cols: list[str],
-                                    targets: list[str], top_k: int = 15) -> dict:
-    """Fit one XGBoost regressor per target, return top-K feature names + scores.
-
-    Uses gain-based importance (XGBoost default).
-    """
+def _make_importance_model():
     import xgboost as xgb
-    out = {}
+    return xgb.XGBRegressor(
+        n_estimators=300, max_depth=4, learning_rate=0.08,
+        subsample=0.85, colsample_bytree=0.7,
+        random_state=config.RANDOM_STATE, n_jobs=-1,
+        tree_method="hist",
+    )
+
+
+def _feature_importances_per_target(work: pd.DataFrame, feature_cols: list[str],
+                                    targets: list[str], top_k: int = 15,
+                                    n_repeats: int = 5) -> dict:
+    """Per-target feature importances, measured OUT OF SAMPLE.
+
+    These rankings are fed to the step-6 LLM as "which property families matter
+    most", so they end up as claims in a scientific report. They used to be
+    XGBoost gain importances from a single fit on the FULL dataset — in-sample,
+    with no held-out split. Gain rewards a feature for every split it was used
+    in, including splits that only fit noise, and on this data there is a lot of
+    noise to fit: held-out CV R² is ~0.33-0.54 on n=210. An in-sample ranking
+    over hundreds of features under those conditions is substantially arbitrary,
+    and nothing in the report said so.
+
+    Replaced with K-fold PERMUTATION importance scored on the held-out fold: fit
+    on the train split, then measure how much shuffling each column degrades R²
+    on data the model never saw. A feature that only helped the model memorise
+    training rows scores ~0 here.
+
+    Returns per target a list of dicts, ranked by mean held-out importance:
+
+        feature            column name
+        importance         mean drop in held-out R² when shuffled
+        importance_std     spread of that drop across folds
+        folds_in_top_k     how many folds ranked it top-K  <- stability
+        n_folds            folds actually used
+        method             "permutation_cv" or "gain_in_sample" (fallback)
+
+    `folds_in_top_k` is the number that matters when reading these: a feature
+    top-K in 1 of 5 folds is noise, one top-K in 5 of 5 is signal. Step 6 passes
+    it to the LLM for exactly that reason.
+
+    Falls back to the old in-sample gain when there are too few rows to split,
+    labelled as such so downstream can say which it got.
+    """
+    from sklearn.inspection import permutation_importance
+    from sklearn.model_selection import KFold
+
+    k = int(getattr(config, "CV_FOLDS", 5) or 5)
+    out: dict[str, list[dict]] = {}
+
     for t in targets:
         if t not in work.columns:
             continue
         # XGBoost rejects NaN in y — drop missing-target rows per fit.
         sub = work[[t, *feature_cols]].dropna(subset=[t])
-        if len(sub) < 5:
+        X_all = sub[feature_cols].values
+        y_all = sub[t].values
+        n = len(sub)
+        if n < 5:
             log.warning("Target %s has %d non-NaN rows; skipping importance fit.",
-                        t, len(sub))
+                        t, n)
             continue
-        X = sub[feature_cols].values
-        y = sub[t].values
-        model = xgb.XGBRegressor(
-            n_estimators=300, max_depth=4, learning_rate=0.08,
-            subsample=0.85, colsample_bytree=0.7,
-            random_state=config.RANDOM_STATE, n_jobs=-1,
-            tree_method="hist",
-        )
-        model.fit(X, y)
-        imp = pd.Series(model.feature_importances_, index=feature_cols)
-        top = imp[imp > 0].sort_values(ascending=False).head(top_k)
-        out[t] = [{"feature": name, "importance": float(v)} for name, v in top.items()]
-        log.info("Top features for %s (n=%d): %s", t, len(sub),
-                 ", ".join(f"{r['feature']}({r['importance']:.3f})" for r in out[t][:5]))
+
+        # Need at least ~2 rows per held-out fold for permutation R² to mean
+        # anything. Below that, fall back and say so rather than report a
+        # held-out number computed from 1-2 points.
+        if k < 2 or n < max(10, 2 * k):
+            model = _make_importance_model()
+            model.fit(X_all, y_all)
+            imp = pd.Series(model.feature_importances_, index=feature_cols)
+            top = imp[imp > 0].sort_values(ascending=False).head(top_k)
+            out[t] = [{"feature": name, "importance": float(v),
+                       "importance_std": 0.0, "folds_in_top_k": 1, "n_folds": 1,
+                       "method": "gain_in_sample"} for name, v in top.items()]
+            log.warning(
+                "Target %s: only %d rows — falling back to IN-SAMPLE gain "
+                "importance (no held-out split). Treat the ranking as "
+                "indicative only.", t, n)
+            continue
+
+        kf = KFold(n_splits=k, shuffle=True, random_state=config.RANDOM_STATE)
+        per_fold: list[pd.Series] = []
+        for train_idx, test_idx in kf.split(X_all):
+            model = _make_importance_model()
+            model.fit(X_all[train_idx], y_all[train_idx])
+            r = permutation_importance(
+                model, X_all[test_idx], y_all[test_idx],
+                n_repeats=n_repeats, random_state=config.RANDOM_STATE, n_jobs=-1,
+            )
+            per_fold.append(pd.Series(r.importances_mean, index=feature_cols))
+
+        folds = pd.DataFrame(per_fold)                      # (n_folds, n_features)
+        mean_imp = folds.mean(axis=0)
+        std_imp = folds.std(axis=0, ddof=0)
+        # Stability: how often each feature made that fold's own top-K.
+        in_top = pd.Series(0, index=feature_cols, dtype=int)
+        for _, row in folds.iterrows():
+            for name in row.sort_values(ascending=False).head(top_k).index:
+                in_top[name] += 1
+
+        ranked = mean_imp[mean_imp > 0].sort_values(ascending=False).head(top_k)
+        out[t] = [{
+            "feature": name,
+            "importance": float(ranked[name]),
+            "importance_std": float(std_imp[name]),
+            "folds_in_top_k": int(in_top[name]),
+            "n_folds": len(per_fold),
+            "method": "permutation_cv",
+        } for name in ranked.index]
+
+        if not out[t]:
+            log.warning(
+                "Target %s: NO feature has positive held-out permutation "
+                "importance across %d folds. The model does not generalize on "
+                "this target, so there is no honest ranking to report.", t, k)
+        else:
+            log.info("Top held-out features for %s (n=%d, %d folds): %s", t, n, k,
+                     ", ".join(f"{r['feature']}({r['importance']:.4f}, "
+                               f"stable {r['folds_in_top_k']}/{r['n_folds']})"
+                               for r in out[t][:5]))
     return out
 
 

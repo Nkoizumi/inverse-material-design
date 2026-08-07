@@ -734,9 +734,20 @@ def _ask_ollama(top_candidates: list[dict], eda_summary: str | None,
         "block when discussing that candidate. If a property is absent, do "
         "not cite a number for it.\n\n"
         f"{candidates_text}\n\n"
-        "─── (B) FEATURE IMPORTANCE RANKINGS (names only) ───\n"
+        "─── (B) FEATURE IMPORTANCE RANKINGS (names + stability) ───\n"
         "Use to argue WHICH property families matter most. No numeric scores; "
-        "refer to features by name only.\n\n"
+        "refer to features by name only.\n"
+        "`stability` is how many cross-validation folds independently ranked "
+        "that feature in their own top-K, measured by HELD-OUT permutation "
+        "importance (`method: permutation_cv`). Weight your claims by it: a "
+        "feature stable in most folds is a real signal; one appearing in a "
+        "single fold is noise and must NOT be presented as an established "
+        "driver. If `method` is `gain_in_sample` the ranking had too little "
+        "data for a held-out split — say it is indicative only. If a target's "
+        "feature list is EMPTY, no feature had positive held-out importance: "
+        "state plainly that the data does not support a feature-importance "
+        "claim for that target rather than falling back on generic "
+        "catalysis intuition.\n\n"
         f"{json.dumps(feature_rankings, indent=2)}\n\n"
         "─── (C) GP-vs-BNN AGREEMENT SUMMARY ───\n"
         "Use this exact information in your surrogate-confidence paragraph; "
@@ -1204,17 +1215,40 @@ def _parity_stats_lines(parity_df: pd.DataFrame, target_cols: list[str]) -> str:
 
 
 def _extract_feature_rankings(eda_summary: str | None) -> dict:
+    """Feature names per target, annotated with how STABLE each ranking is.
+
+    Names alone let the LLM present a one-fold fluke and a five-fold-consistent
+    signal in the same confident register. step3 now scores these by held-out
+    permutation importance across CV folds, so `folds_in_top_k` says how many
+    folds independently ranked a feature top-K. That annotation travels into
+    the prompt so the narrative can hedge where the data does.
+
+    Shape: {target: {"method": str, "features": [{"name", "stability"}, ...]}}
+    Falls back to bare names for summaries written before this field existed.
+    """
     if not eda_summary:
         return {}
     try:
         data = json.loads(eda_summary)
     except Exception:
         return {}
-    top = data.get("top_features_per_target", {})
-    return {
-        target: [entry["feature"] for entry in entries]
-        for target, entries in top.items()
-    }
+
+    out: dict = {}
+    for target, entries in (data.get("top_features_per_target") or {}).items():
+        if not entries:
+            out[target] = {"method": "none",
+                           "note": "no feature had positive held-out importance",
+                           "features": []}
+            continue
+        method = entries[0].get("method", "unknown")
+        features = []
+        for e in entries:
+            item = {"name": e["feature"]}
+            if e.get("n_folds"):
+                item["stability"] = f"{e.get('folds_in_top_k', 0)}/{e['n_folds']} folds"
+            features.append(item)
+        out[target] = {"method": method, "features": features}
+    return out
 
 
 if __name__ == "__main__":

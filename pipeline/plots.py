@@ -3,7 +3,7 @@
 Four figures are produced (dual-target catalyst mode):
 
   1. Pareto frontier — training data + BO candidate predictions with σ.
-  2. Feature importance bars — top XGBoost-gain features per target.
+  2. Feature importance bars — top held-out permutation features per target.
   3. GP vs BNN agreement scatter — predictions of both surrogates on each
      candidate, with diagonal reference line.
   4. Candidate property heatmap — rows = top candidates, cols = key
@@ -136,7 +136,10 @@ def make_feature_importance_plot(
         for bar, v in zip(bars, imps):
             ax.text(v + max_imp * 0.012, bar.get_y() + bar.get_height() / 2,
                     f"{v:.3f}", va="center", fontsize=11)
-        ax.set_xlabel("Feature importance (XGBoost gain)", fontsize=12)
+        # Label the actual measure. These are held-out permutation scores
+        # (mean drop in CV R² when the column is shuffled), not the
+        # in-sample gain this axis used to claim.
+        ax.set_xlabel(_importance_axis_label(entries), fontsize=12)
         ax.set_title(f"Top {top_k} features — {target}", fontsize=13)
         ax.tick_params(axis="y", labelsize=11)
         ax.tick_params(axis="x", labelsize=10)
@@ -145,6 +148,20 @@ def make_feature_importance_plot(
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_path
+
+
+def _importance_axis_label(entries: list[dict]) -> str:
+    """Name the measure the bars actually show.
+
+    step3 reports held-out permutation importance (mean drop in CV R² when a
+    column is shuffled) and falls back to in-sample gain only when there are
+    too few rows to split. The axis has to say which one it got — the two mean
+    very different things, and the old label hard-coded "XGBoost gain".
+    """
+    method = entries[0].get("method", "permutation_cv") if entries else "permutation_cv"
+    if method == "gain_in_sample":
+        return "Feature importance (XGBoost gain, IN-SAMPLE — indicative only)"
+    return "Permutation importance (mean drop in held-out R²)"
 
 
 def _short_name(name: str, max_len: int) -> str:
