@@ -681,6 +681,7 @@ def generate_report_bundle(
         enriched_records, eda_summary_str, config.TARGET_COLS, figures,
         agreement_summary, is_fraction=is_fraction,
     )
+    llm_narrative = _repair_figure_links(llm_narrative, figures)
 
     # Attach the captions to the corresponding figures (fall back to the
     # hand-written default_description if the LLM didn't provide one).
@@ -756,6 +757,74 @@ _CAPTIONS_BLOCK_RE = re.compile(
     r"<<<FIGURE_CAPTIONS>>>\s*(.*?)\s*<<<END_FIGURE_CAPTIONS>>>",
     re.DOTALL,
 )
+
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
+_TS_SUFFIX_RE = re.compile(r"_\d{8}_\d{6}$")
+
+
+def _figure_link_key(filename: str) -> str:
+    """`parity_cv_20260807_202446.png` → `parity_cv`. Strips the directory,
+    extension and the shared wall-clock stamp, leaving the part that identifies
+    which figure was meant."""
+    return _TS_SUFFIX_RE.sub("", Path(filename).name.rsplit(".", 1)[0])
+
+
+def _repair_figure_links(narrative: str, figures: list[FigureEntry]) -> str:
+    """Point every `![alt](file.png)` in the narrative at a figure that exists.
+
+    The prompt gives the model the exact filenames and tells it to use them
+    verbatim; phi-4 still paraphrases. Observed: it embedded
+    `parity_20260807_202446.png` when the file written was
+    `parity_cv_20260807_202446.png` — the CV/in-sample distinction is in the
+    filename, and the model dropped it. That leaves a dead image in the saved
+    Markdown. (The webui survives it: `_split_narrative_around_figures`
+    ignores unknown filenames and appends the real figure at the end. The `.md`
+    on disk has no such fallback, which is why this is fixed at the source
+    rather than in the renderer.)
+
+    A near-miss is rewritten only when it resolves to exactly ONE figure —
+    either by `figure_id` or by one key being a prefix of the other. An
+    ambiguous or unrecognizable link is dropped, not guessed: a missing figure
+    is recoverable, a caption pointing at the WRONG figure is a false claim
+    about the data.
+    """
+    if not narrative:
+        return narrative
+
+    known = {f.png_filename for f in figures if f.png_filename}
+    aliases: dict[str, set[str]] = {}
+    for f in figures:
+        if not f.png_filename:
+            continue
+        for key in {_figure_link_key(f.png_filename), f.figure_id}:
+            aliases.setdefault(key, set()).add(f.png_filename)
+
+    def _resolve(cited: str) -> str | None:
+        name = Path(cited).name
+        if name in known:
+            return name
+        key = _figure_link_key(name)
+        if not key:
+            return None
+        hits = set(aliases.get(key, ()))
+        if not hits:
+            hits = {fn for k, fns in aliases.items()
+                    if k.startswith(key) or key.startswith(k)
+                    for fn in fns}
+        return next(iter(hits)) if len(hits) == 1 else None
+
+    def _sub(m: re.Match) -> str:
+        alt, cited = m.group(1), m.group(2)
+        fixed = _resolve(cited)
+        if fixed == cited:
+            return m.group(0)
+        if fixed:
+            log.info("Repaired figure link in narrative: %r → %r.", cited, fixed)
+            return f"![{alt}]({fixed})"
+        log.warning("Dropped unresolvable figure link from narrative: %r.", cited)
+        return ""
+
+    return _MD_IMAGE_RE.sub(_sub, narrative)
 
 
 def _render_per_candidate_section(top_candidates: list[dict]) -> str:
