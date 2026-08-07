@@ -55,7 +55,6 @@ TARGET_TWINS = {
     # for it, so it can't legitimately contribute to inverse-design scoring.
     "propane_selectivity",
 }
-FORMULA_COL = "composition"              # ignored in catalyst mode
 
 # Task type (regression / classification)
 TASK = "regression"
@@ -189,7 +188,6 @@ AUTO_EDA_PATH: Path | None = next(
 #   "all"  — gp + svgp + bnn
 #   Or comma-separated, e.g. "gp,svgp" or "svgp,bnn".
 SURROGATE_KIND = "both"
-GP_TRAINING_ITERS = 200
 BNN_TRAINING_ITERS = 1000
 SVGP_NUM_INDUCING = 256      # inducing points; clamped to N if smaller
 SVGP_TRAINING_ITERS = 400
@@ -252,8 +250,6 @@ GP_LENGTHSCALE_PRIOR_RATE          = 1.0   # Gamma β → mode = (α-1)/β = 2.0
 CV_FOLDS = 5
 
 # Inverse design
-BO_N_INITIAL = 20
-BO_N_ITERATIONS = 5
 BO_BATCH_SIZE = 20
 # In catalyst mode, over-fetch by this factor before deduplicating the
 # batch on displayed catalyst identity (metal, promoters, support, loadings).
@@ -276,7 +272,23 @@ BO_MAX_PER_FAMILY = 4
 # that the acquisition-ranked pool still contains BO_BATCH_SIZE catalysts
 # after the family-cap sweep. 5× is comfortable for q=20 with 6-family panels.
 BO_FAMILY_OVERSAMPLE = 5
-CHEM_VIABILITY_FILTER = True   # SMACT charge-balance + electronegativity
+# Chunk size for optimize_acqf_discrete's posterior evaluation. Lower it if a
+# large library exhausts GPU memory; it does not affect which candidates are
+# selected, only how many are scored at once.
+BO_ACQ_BATCH_SIZE = 512
+
+# Atomic-fraction BO library — only used when CATALYST_FRACTION_MODE is True.
+# The library is SAMPLED from the training data's composition manifold rather
+# than enumerated, so its size is a knob rather than a product of panel sizes.
+CATALYST_FRACTION_LIBRARY_SIZE = 10_000
+# Cap on total non-support atomic fraction when sampling that library.
+CATALYST_FRACTION_MAX_TOTAL_METAL = 0.05
+
+# Steels benchmark library — only used by the matbench_steels preset, which
+# sets STEELS_LIBRARY=True to route step 5 through the discrete steels path
+# instead of continuous BO.
+STEELS_LIBRARY = False
+STEELS_LIBRARY_SIZE = 10_000
 
 # Catalyst design library — only used when CATALYST_MODE is True.
 # Cartesian product over these lists builds the discrete search space.

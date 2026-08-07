@@ -323,6 +323,17 @@ def run_pipeline(
         config.LIBRARY_METAL_LOADINGS = _list_str_to_floats(metal_loads_str)
         config.LIBRARY_PROMO_LOADINGS = _list_str_to_floats(promo_loads_str)
 
+        # Validate the config the UI just assembled before spending any time on
+        # it. The web UI is where inconsistent states came from — it mutates a
+        # dozen module globals per run and inherits whatever config.py held for
+        # the rest — so this is the entry point that most needs the check.
+        try:
+            from config_schema import check as _check_config
+            _check_config(config)
+        except ValueError as e:
+            yield log(str(e)), None, None, pd.DataFrame()
+            return
+
         progress(0.05, desc="Step 1 — load CSV")
         df = step1_load.load_dataset()
         yield log(f"Loaded {len(df)} rows."), None, None, pd.DataFrame()

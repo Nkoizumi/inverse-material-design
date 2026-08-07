@@ -53,7 +53,6 @@ PRESETS = {
         "MATMINER_DATASET": "matbench_steels",
         "TARGET_COLS": ["yield strength"],
         "OPTIMIZATION_DIRECTIONS": ["max"],
-        "FORMULA_COL": "composition",
         "CATALYST_MODE": False,
         "SURROGATE_KIND": "gp",
         # Steels discrete library — avoids continuous-BO mode collapse.
@@ -114,6 +113,14 @@ def main() -> None:
 
     if args.preset:
         _apply_preset(args.preset)
+
+    # Fail on an inconsistent config here, not several minutes into a
+    # featurization — and, more to the point, not silently. An
+    # invalid schema-mode combination produces a completed run with
+    # plausible-looking candidates from the wrong featurizer.
+    import config
+    from config_schema import check
+    check(config)
 
     skip = set(args.skip)
     t0 = time.time()
