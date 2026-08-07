@@ -861,17 +861,12 @@ def _build_figures(
     out: list[FigureEntry] = []
 
     # Parity: prefer k-fold CV (held-out) parity, fall back to in-sample.
-    cv_path = config.DATA_DIR / "cv_parity_predictions.parquet"
-    in_sample_path = config.DATA_DIR / "training_predictions.parquet"
-    if cv_path.exists():
-        parity_path = cv_path
-        is_cv = True
-    elif in_sample_path.exists():
-        parity_path = in_sample_path
-        is_cv = False
-    else:
-        parity_path = None
-        is_cv = False
+    # step4 deletes both artifacts before refitting, so presence here means
+    # "produced by the run that just finished". The extra covers-our-targets
+    # check catches the remaining case where a file survives a crash and the
+    # target set has since changed — labelling one target's CV numbers as if
+    # they described another's would be worse than drawing no figure at all.
+    parity_path, is_cv = _select_parity_artifact()
 
     if parity_path is not None:
         try:
@@ -1021,6 +1016,35 @@ def _build_figures(
     return out
 
 
+def _parity_covers_targets(path: Path, target_cols: list[str]) -> bool:
+    """True if `path` holds true-value columns for every configured target."""
+    try:
+        cols = set(pd.read_parquet(path).columns)
+    except Exception as e:
+        log.warning("Could not read parity artifact %s (%s); ignoring it.", path.name, e)
+        return False
+    missing = [t for t in target_cols if f"true_{t}" not in cols]
+    if missing:
+        log.warning(
+            "Parity artifact %s has no true-value column for target(s) %s — it "
+            "is left over from a run with a different target set. Ignoring it "
+            "rather than mislabelling its numbers.", path.name, missing,
+        )
+        return False
+    return True
+
+
+def _select_parity_artifact() -> tuple[Path | None, bool]:
+    """Pick the parity parquet to plot. Returns (path, is_cv)."""
+    cv_path = config.DATA_DIR / "cv_parity_predictions.parquet"
+    in_sample_path = config.DATA_DIR / "training_predictions.parquet"
+    targets = list(config.TARGET_COLS)
+    for path, is_cv in ((cv_path, True), (in_sample_path, False)):
+        if path.exists() and _parity_covers_targets(path, targets):
+            return path, is_cv
+    return None, False
+
+
 def _build_agreement_summary(records: list[dict], target_cols: list[str]) -> dict | None:
     """Compact top-level GP-vs-BNN agreement summary. Keeps it OUT of each
     candidate dict (which bloats per-candidate JSON and confuses small models)
@@ -1097,13 +1121,10 @@ def _deterministic_parity_caption(llm_caption_raw: str) -> str:
     R²-grounded verdict. The LLM's own caption (if produced) is appended for
     flavor but the leading factual statement is guaranteed honest.
     """
-    cv_path = config.DATA_DIR / "cv_parity_predictions.parquet"
-    in_sample_path = config.DATA_DIR / "training_predictions.parquet"
-    if cv_path.exists():
-        parity_path, is_cv = cv_path, True
-    elif in_sample_path.exists():
-        parity_path, is_cv = in_sample_path, False
-    else:
+    # Must use the SAME selection as _build_figures, otherwise the caption can
+    # quote held-out CV numbers under an in-sample figure.
+    parity_path, is_cv = _select_parity_artifact()
+    if parity_path is None:
         return llm_caption_raw.strip()
 
     try:

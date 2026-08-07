@@ -1,5 +1,6 @@
 """Central configuration for the inverse material design pipeline."""
 
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -155,6 +156,27 @@ OPTIONAL_NUMERIC_FEATURES = [
 # Auto-EDA
 OLLAMA_HOST = "http://localhost:11434"
 AUTO_EDA_AVAILABLE = True   # set False to skip step 3 entirely
+
+# Step 3 imports the Orchestrator from a SEPARATE project (github.com/Nkoizumi/
+# llm-eda-mobo, developed locally as ~/auto_eda). It is not a pip dependency
+# and not vendored here. Resolution order:
+#   1. $INVERSE_DESIGN_AUTO_EDA_PATH
+#   2. a sibling `auto_eda` checkout next to this repository
+#   3. ~/auto_eda
+# If none of those resolve, step 3 logs a warning and is skipped — the rest of
+# the pipeline runs fine without it (`--skip eda` makes that explicit).
+AUTO_EDA_PATH: Path | None = next(
+    (
+        p for p in (
+            Path(os.environ["INVERSE_DESIGN_AUTO_EDA_PATH"])
+            if os.environ.get("INVERSE_DESIGN_AUTO_EDA_PATH") else None,
+            ROOT.parent / "auto_eda",
+            Path.home() / "auto_eda",
+        )
+        if p is not None and p.is_dir()
+    ),
+    None,
+)
 
 # Surrogate
 # Accepted values:

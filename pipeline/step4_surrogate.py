@@ -24,6 +24,7 @@ import pandas as pd
 import torch
 
 import config
+from seeding import seed_everything
 
 log = logging.getLogger(__name__)
 
@@ -524,6 +525,11 @@ class BNNSurrogate(Surrogate):
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 def fit_surrogates(df: pd.DataFrame) -> dict:
+    # Pin the global RNGs before any model is built: fit_gpytorch_mll, the SVGP
+    # Adam loop and Pyro's AutoNormal guide all initialise from torch's global
+    # RNG, so an unseeded run gives a different surrogate every time.
+    seed_everything()
+    _invalidate_parity_artifacts()
     data = prepare_xy(df)
     out = {"data": data}
     kinds = _active_kinds()
@@ -560,6 +566,35 @@ def fit_surrogates(df: pd.DataFrame) -> dict:
         log.warning("Could not pickle surrogates (%s). Skipping checkpoint.", e)
 
     return out
+
+
+PARITY_ARTIFACTS = ("training_predictions.parquet", "cv_parity_predictions.parquet")
+
+
+def _invalidate_parity_artifacts() -> None:
+    """Delete last run's parity parquets before refitting.
+
+    step6 picks which parity figure to draw with a bare
+    `cv_parity_predictions.parquet.exists()` check and labels it "held-out
+    k-fold CV". Without this, running once with CV_FOLDS=5 and then again with
+    CV_FOLDS=0 leaves the old file on disk and the second run's report claims
+    held-out generalization numbers that the run never computed. The same
+    applies when a run crashes between step 4 and step 6, or when the target
+    set changes between runs.
+
+    Each artifact is rewritten below if — and only if — it is actually
+    produced, so deleting up front makes "file present" mean "this run made
+    it".
+    """
+    for name in PARITY_ARTIFACTS:
+        path = config.DATA_DIR / name
+        if path.exists():
+            try:
+                path.unlink()
+                log.info("Invalidated stale parity artifact %s.", name)
+            except OSError as e:
+                log.warning("Could not remove stale %s (%s). step6 may report "
+                            "parity numbers from an earlier run.", name, e)
 
 
 def _save_training_predictions(data: XYData, surrogates: dict) -> None:

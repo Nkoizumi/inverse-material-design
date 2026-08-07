@@ -121,8 +121,20 @@ Everything is in `config.py`. Key knobs:
 - `SURROGATE_KIND` — `gp` (default), `bnn`, or `both`.
 - `CV_FOLDS` — 5-fold CV for parity plots (0 to disable).
 
+- `RANDOM_STATE` — seeds python / numpy / torch and the BO acquisition
+  sampler. Two runs of the same preset select the same catalysts.
+
 Presets in `run_pipeline.py` override these in-process — see the `PRESETS`
 dict for exact settings.
+
+## Tests
+
+```bash
+python -m pytest tests/
+```
+
+Covers target-twin / preset consistency, `prepare_xy`'s leakage and
+constant-column guards, parity-artifact staleness, and BO reproducibility.
 
 ## Layout
 
@@ -162,8 +174,13 @@ inverse_material_design/
 - PDH literature dataset (n=85) is data-limited. Cannot separate
   composition from reaction conditions cleanly at this sample size. Use
   ACS (n=210) or wait for the DCP dataset for anything beyond exploration.
-- The auto-EDA step relies on a local Ollama daemon at
-  `http://localhost:11434`. Skip with `--skip eda` if you don't have one.
+- The auto-EDA step (step 3) needs **two** things that are not pip
+  dependencies: a local Ollama daemon at `http://localhost:11434`, and a
+  checkout of the separate [llm-eda-mobo](https://github.com/Nkoizumi/llm-eda-mobo)
+  project. Point `INVERSE_DESIGN_AUTO_EDA_PATH` at that checkout, place it
+  alongside this repository, or put it at `~/auto_eda`. If it isn't found,
+  step 3 logs a warning and is skipped; `--skip eda` does the same
+  explicitly. Every other step is unaffected.
 
 ## Citation
 

@@ -20,6 +20,7 @@ import pandas as pd
 import torch
 
 import config
+from seeding import make_sampler, seed_everything
 from step4_surrogate import XYData
 
 log = logging.getLogger(__name__)
@@ -50,6 +51,12 @@ def _get_signs(n_targets: int) -> torch.Tensor:
 # ─────────────────────────────────────────────────────────────────────────────
 def run_inverse(df: pd.DataFrame, surrogates: dict,
                 transformer=None) -> pd.DataFrame:
+    # Re-seed at the top of step 5 rather than relying on whatever RNG state
+    # step 4 happened to leave behind: the amount of randomness step 4 consumes
+    # depends on CV_FOLDS and SURROGATE_KIND, so without this the BO batch
+    # would silently change when you toggle CV on or off.
+    seed_everything()
+
     data: XYData = surrogates["data"]
     # Driver priority: exact GP > SVGP > BNN. BNN cross-check kept for the
     # candidate report when GP is the driver and BNN is also fit (existing
@@ -174,6 +181,7 @@ def _optimize_continuous(surrogate, data: XYData, multi_objective: bool) -> torc
         acq = qLogNoisyExpectedImprovement(
             model=surrogate.model, X_baseline=data.X,
             posterior_transform=ScalarizedPosteriorTransform(weights=signs),
+            sampler=make_sampler(multi_objective=False),
         )
     else:
         objective = WeightedMCMultiOutputObjective(weights=signs)
@@ -182,6 +190,7 @@ def _optimize_continuous(surrogate, data: XYData, multi_objective: bool) -> torc
         acq = qLogNoisyExpectedHypervolumeImprovement(
             model=surrogate.model, X_baseline=data.X, ref_point=ref,
             objective=objective,
+            sampler=make_sampler(multi_objective=True),
         )
 
     candidates, _ = optimize_acqf(
@@ -323,6 +332,7 @@ def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
         acq = qLogNoisyExpectedHypervolumeImprovement(
             model=surrogate.model, X_baseline=data.X, ref_point=ref,
             objective=objective,
+            sampler=make_sampler(multi_objective=True),
         )
     else:
         from botorch.acquisition.logei import qLogNoisyExpectedImprovement
@@ -330,6 +340,7 @@ def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
         acq = qLogNoisyExpectedImprovement(
             model=surrogate.model, X_baseline=data.X,
             posterior_transform=ScalarizedPosteriorTransform(weights=signs),
+            sampler=make_sampler(multi_objective=False),
         )
 
     # 5. Discrete acquisition -------------------------------------------------
@@ -467,6 +478,7 @@ def _run_catalyst_fraction_discrete(df: pd.DataFrame, data: XYData,
         acq = qLogNoisyExpectedHypervolumeImprovement(
             model=surrogate.model, X_baseline=data.X, ref_point=ref,
             objective=objective,
+            sampler=make_sampler(multi_objective=True),
         )
     else:
         from botorch.acquisition.logei import qLogNoisyExpectedImprovement
@@ -474,6 +486,7 @@ def _run_catalyst_fraction_discrete(df: pd.DataFrame, data: XYData,
         acq = qLogNoisyExpectedImprovement(
             model=surrogate.model, X_baseline=data.X,
             posterior_transform=ScalarizedPosteriorTransform(weights=signs),
+            sampler=make_sampler(multi_objective=False),
         )
 
     # 5. Discrete acquisition -------------------------------------------------
@@ -585,10 +598,17 @@ def _run_steels_discrete(df: pd.DataFrame, data: XYData, surrogate,
     feature_cols_lib = [c for c in work.columns
                         if c not in ("composition", "composition_str")]
     before = len(work)
-    work = work.dropna(subset=feature_cols_lib).reset_index(drop=True)
+    # Select the surviving rows by POSITION and apply the same mask to both
+    # frames. The previous version read `work.index` *after*
+    # `reset_index(drop=True)`, which yields 0..n-1 and therefore selected the
+    # first n rows of library_raw rather than the rows that actually survived
+    # — silently pairing each candidate's composition string with a different
+    # candidate's features and predictions.
+    kept_pos = np.flatnonzero(work[feature_cols_lib].notna().all(axis=1).values)
+    work = work.iloc[kept_pos].reset_index(drop=True)
     if before != len(work):
         log.info("Dropped %d library rows that failed featurization.", before - len(work))
-    library_raw = library_raw.iloc[work.index.tolist()].reset_index(drop=True)
+    library_raw = library_raw.iloc[kept_pos].reset_index(drop=True)
     library_feat = work.drop(columns=["composition"])
 
     # 2. Optional Tab-2 transformer — apply (NOT re-fit) so library matches
@@ -652,6 +672,7 @@ def _run_steels_discrete(df: pd.DataFrame, data: XYData, surrogate,
         acq = qLogNoisyExpectedHypervolumeImprovement(
             model=surrogate.model, X_baseline=data.X, ref_point=ref,
             objective=objective,
+            sampler=make_sampler(multi_objective=True),
         )
     else:
         from botorch.acquisition.logei import qLogNoisyExpectedImprovement
@@ -659,6 +680,7 @@ def _run_steels_discrete(df: pd.DataFrame, data: XYData, surrogate,
         acq = qLogNoisyExpectedImprovement(
             model=surrogate.model, X_baseline=data.X,
             posterior_transform=ScalarizedPosteriorTransform(weights=signs),
+            sampler=make_sampler(multi_objective=False),
         )
 
     from botorch.optim.optimize import optimize_acqf_discrete

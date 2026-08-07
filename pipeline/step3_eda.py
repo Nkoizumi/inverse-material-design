@@ -17,21 +17,35 @@ import config
 
 log = logging.getLogger(__name__)
 
-AUTO_EDA_PATH = Path("/home/nao/auto_eda")
-
 
 def run_eda(df: pd.DataFrame) -> dict:
     if not config.AUTO_EDA_AVAILABLE:
         log.info("AUTO_EDA_AVAILABLE=False; skipping step 3.")
         return {}
 
-    if str(AUTO_EDA_PATH) not in sys.path:
-        sys.path.insert(0, str(AUTO_EDA_PATH))
+    # The Orchestrator lives in a separate project (see config.AUTO_EDA_PATH
+    # for the resolution order). It used to be a hardcoded absolute path into
+    # the author's home directory, so step 3 could never run on anyone else's
+    # machine. Absence is not an error — the pipeline is fully usable without
+    # auto-EDA, which is what `--skip eda` does explicitly.
+    auto_eda_path: Path | None = getattr(config, "AUTO_EDA_PATH", None)
+    if auto_eda_path is None:
+        log.warning(
+            "auto-EDA project not found; skipping step 3. Set "
+            "INVERSE_DESIGN_AUTO_EDA_PATH to a checkout of "
+            "github.com/Nkoizumi/llm-eda-mobo, place one alongside this "
+            "repository, or run with `--skip eda`."
+        )
+        return {}
+
+    if str(auto_eda_path) not in sys.path:
+        sys.path.insert(0, str(auto_eda_path))
 
     try:
         from pipeline.orchestrator import Orchestrator  # noqa: E402
     except Exception as e:
-        log.warning("Could not import auto_eda Orchestrator (%s); skipping EDA.", e)
+        log.warning("Could not import auto_eda Orchestrator from %s (%s); "
+                    "skipping EDA.", auto_eda_path, e)
         return {}
 
     # Auto-EDA takes a single target. For dual-target runs we EDA the primary one
