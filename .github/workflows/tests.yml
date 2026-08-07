@@ -11,18 +11,18 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Gradio phones home on import unless this is set.
+  GRADIO_ANALYTICS_ENABLED: "False"
+  # No display on the runner; matplotlib is pulled in via the report path.
+  MPLBACKEND: Agg
+  # The suite asserts BO reproducibility, so keep hash ordering fixed too.
+  PYTHONHASHSEED: "0"
+
 jobs:
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
-    env:
-      # Gradio phones home on import unless this is set.
-      GRADIO_ANALYTICS_ENABLED: "False"
-      # No display on the runner; matplotlib is pulled in via the report path.
-      MPLBACKEND: Agg
-      # The suite asserts BO reproducibility, so keep hash ordering fixed too.
-      PYTHONHASHSEED: "0"
 
     steps:
       - uses: actions/checkout@v4
@@ -48,13 +48,15 @@ jobs:
       - name: Install requirements
         # Installs the exact file users are told to install, so a broken pin
         # fails here rather than in someone's first five minutes with the repo.
-        # torch is already satisfied: 2.12.1+cpu matches the ==2.12.1 pin.
+        # This caught two real breakages on its first run: an unsatisfiable
+        # scipy pin, and pyarrow never being declared despite 18 parquet call
+        # sites. torch is already satisfied — 2.12.1+cpu matches the ==2.12.1 pin.
         run: pip install -r requirements.txt
 
       - name: Report environment
         run: |
           python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
-          python -c "import botorch, gpytorch, pyro, matminer, pymatgen, gradio; print('deps import OK')"
+          python -c "import botorch, gpytorch, pyro, matminer, pymatgen, pyarrow, gradio; print('deps import OK')"
 
       - name: Run test suite
         # Several of these guard invariants that fail SILENTLY when broken —
@@ -63,13 +65,45 @@ jobs:
         # this workflow exists.
         run: python -m pytest tests/ -q --durations=10
 
-      - name: Run the README quick-start end to end
-        # Unit tests do not exercise step 1 -> 5 as a pipeline. This is the
-        # exact command the README puts in front of a new user; EDA and report
-        # are skipped because both need a local Ollama daemon.
+      - name: End-to-end smoke (steps 1 → 5)
+        # Unit tests never run the stages as a pipeline. ~25 s on CPU. See the
+        # module docstring for why this is not the full README command.
+        run: python scripts/ci_smoke.py
+
+  # The exact command the README puts in front of a new user. Manual only:
+  # it runs MOBO over an ~8k-row library at q=80, which is GPU-assisted on a
+  # workstation (~2 min) but exceeded 12 minutes in step 5 alone on a 24-core
+  # CPU box — a hosted two-core runner is worse. The `tests` job's smoke step
+  # covers the same wiring in ~25 s; run this before a release, or when
+  # changing step 5.
+  quickstart:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install CPU-only torch
+        run: |
+          set -euo pipefail
+          TORCH_PIN=$(grep -E '^torch==' requirements.txt)
+          pip install "$TORCH_PIN" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Run the README quick-start
+        # EDA and report are skipped because both need a local Ollama daemon.
         run: python run_pipeline.py --preset synthetic_catalyst --skip eda report
 
-      - name: Confirm the quick-start produced candidates
+      - name: Confirm the quick-start produced discriminating candidates
         run: |
           python - <<'PY'
           import pandas as pd, sys
@@ -82,8 +116,6 @@ jobs:
           print(f"{len(df)} candidates, prediction columns: {preds}")
           if df.empty or not preds:
               sys.exit("candidates.parquet is empty or has no predictions")
-          # A collapsed posterior returns the prior mean for every row; that has
-          # been a real failure mode here, and it does not raise on its own.
           primary = preds[0]
           if df[primary].round(9).nunique() == 1:
               sys.exit(f"all candidates share one predicted {primary} "
