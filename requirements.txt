@@ -29,7 +29,10 @@ plotly==6.7.0
 # Materials-science featurization
 matminer==0.10.1
 pymatgen==2026.3.23
-smact==4.0.0
+# smact was pinned here to back config.CHEM_VIABILITY_FILTER, a documented
+# "SMACT charge-balance + electronegativity" screen on generated candidates.
+# That flag was read by no code and the library imported nowhere, so both were
+# removed. Re-add it if the viability filter is ever actually implemented.
 
 # Surrogates: exact GP + multi-task GP + BNN
 torch==2.12.1
