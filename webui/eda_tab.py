@@ -48,6 +48,35 @@ THEME = dict(
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def row_alignment_error(n_before: int, n_after: int) -> str | None:
+    """Return an error message if targets can no longer be paired to rows.
+
+    Tab 2 re-attaches the untransformed target columns to the transformed
+    feature frame BY POSITION, which is only valid while the transformer
+    preserves both row count and row order.
+
+    It does today: auto_eda's OutlierHandler clips (iqr/zscore) or imputes to
+    the column median (isolation_forest) rather than dropping rows, and no
+    other step in that pipeline touches the row axis. But this used to be
+    written as `df[t].values[:len(tdf)]`, which silently TRUNCATED — so a
+    transformer that ever did drop rows would have paired each target value
+    with the wrong catalyst and produced a quietly mistrained surrogate, with
+    nothing raised and nothing logged.
+
+    Refusing is the right failure mode here: a visible error is recoverable,
+    a silent mispairing is not. Returns None when the frames line up.
+    """
+    if n_before == n_after:
+        return None
+    return (
+        f"Transform changed the row count ({n_before} → {n_after}), so the "
+        f"target columns can no longer be matched to their rows by position. "
+        f"Refusing to re-attach them rather than risk pairing a target value "
+        f"with the wrong catalyst — this needs an index-preserving transform "
+        f"before Tab 2 can be used here."
+    )
+
+
 def _numeric_cols(df: pd.DataFrame) -> list[str]:
     return df.select_dtypes(include=np.number).columns.tolist()
 
@@ -730,11 +759,18 @@ def render_transformed_data(
 
         # Re-attach the original (un-transformed) target values so multi-target
         # users see ALL their targets next to the transformed features.
+        problem = row_alignment_error(len(df), len(tdf))
+        if problem:
+            return (
+                problem,
+                "", None, None, gr.update(choices=[], value=None), None, None,
+            )
+
         tdf = tdf.reset_index(drop=True).copy()
         target_block = []
         for t in drop_cols:
             if t in df.columns:
-                tdf[t] = df[t].reset_index(drop=True).values[:len(tdf)]
+                tdf[t] = df[t].reset_index(drop=True).values
                 target_block.append(t)
 
         before_cols = len(df.columns)

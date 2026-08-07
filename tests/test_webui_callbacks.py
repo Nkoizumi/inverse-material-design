@@ -29,6 +29,7 @@ if str(ROOT / "webui") not in sys.path:
 
 import app  # noqa: E402
 import config  # noqa: E402
+import eda_tab  # noqa: E402
 
 
 # ── W1: load_csv output arity ────────────────────────────────────────────────
@@ -236,6 +237,23 @@ def test_role_upload_is_not_flagged():
     msg = app.load_csv(None, use_synthetic=True)[2]
     assert "role-based" in msg
     assert "minimal report" not in msg
+
+
+# ── W7: targets must never be paired to the wrong rows ───────────────────────
+def test_row_alignment_passes_when_counts_match():
+    assert eda_tab.row_alignment_error(210, 210) is None
+    assert eda_tab.row_alignment_error(0, 0) is None
+
+
+@pytest.mark.parametrize("before,after", [(210, 199), (72, 70), (100, 101)])
+def test_row_alignment_refuses_on_any_row_count_change(before, after):
+    """The old code truncated with `.values[:len(tdf)]`, pairing each target
+    with the wrong catalyst and raising nothing. Refuse instead — a visible
+    error is recoverable, a silent mispairing is not."""
+    msg = eda_tab.row_alignment_error(before, after)
+    assert msg is not None
+    assert str(before) in msg and str(after) in msg
+    assert "wrong catalyst" in msg
 
 
 # ── W9: only numeric columns may be offered as targets ───────────────────────

@@ -111,7 +111,15 @@ def prepare_xy(df: pd.DataFrame) -> XYData:
     if getattr(config, "COMPOSITION_ONLY_FEATURES", False):
         loading_cols = set(getattr(config, "CATALYST_LOADINGS", {}).values())
         def _is_composition(c: str) -> bool:
-            if "_phys_" in c or "E_ads_" in c or c.startswith("interfacial_"):
+            # `intf_`, not `interfacial_` — that is the prefix the featurizers
+            # actually emit (catalyst_features._add_interfacial and
+            # catalyst_fraction_features both produce intf_lattice_mismatch,
+            # intf_delta_work_function_eV, intf_delta_chi). The old spelling
+            # matched nothing; those columns were dropped anyway by the
+            # catch-all `return False` below, so this is a clarity fix with no
+            # behavioural change — but a reader could reasonably have believed
+            # the interfacial block was being handled explicitly.
+            if "_phys_" in c or "E_ads_" in c or c.startswith("intf_"):
                 return False
             if c == "is_mixed_oxide":
                 return False
