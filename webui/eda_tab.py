@@ -242,6 +242,14 @@ def render_distributions(df: pd.DataFrame) -> None:
         "Std":      [df[c].std() for c in num_cols],
         "Skewness": [round(df[c].skew(), 3) for c in num_cols],
         "Kurtosis": [round(df[c].kurtosis(), 3) for c in num_cols],
+        # NOTE ON THE KURTOSIS THRESHOLD: pandas' .kurtosis() is FISHER'S
+        # (excess) kurtosis — a normal distribution scores 0, not 3. The `> 3`
+        # here therefore means "excess kurtosis above 3", i.e. tails heavier
+        # than roughly a t(5); it is a deliberately conservative flag, not the
+        # Pearson-convention "normal = 3" test it resembles. Do not "correct"
+        # it to 0 without deciding that: the skew term already catches
+        # asymmetric features, and dropping to 0 would mark almost every real
+        # column as needing a transform.
         "Needs transform?": [
             "Yes" if abs(df[c].skew()) > 0.5 or abs(df[c].kurtosis()) > 3
             else "No"
@@ -357,21 +365,55 @@ def render_outliers(df: pd.DataFrame) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Sub-tab 5 — Correlations
 # ─────────────────────────────────────────────────────────────────────────────
+CORRELATION_COLUMN_CAP = 30
+
+
+def _correlation_columns(df: pd.DataFrame,
+                         num_cols: list[str]) -> tuple[list[str], str]:
+    """Choose which numeric columns the correlation heatmap shows.
+
+    A cap is needed — a wide frame produces an unreadable matrix — but the cap
+    used to take `num_cols[:30]`, i.e. whichever columns happened to come first
+    in the CSV. That is a criterion nobody chose, and it matters because a user
+    can read "no high-correlation pairs" off the resulting table and conclude
+    something about the dataset. Column order carries no information about
+    which correlations are worth seeing.
+
+    Rank by variance instead: a constant or near-constant column cannot
+    correlate with anything (its correlation is NaN), so spending a slot on one
+    is strictly wasteful, and the highest-variance columns are where real
+    structure lives. Returns the columns in their ORIGINAL order so the heatmap
+    axes stay in a layout the user recognises from their file.
+
+    Returns (columns, note) where note is "" when nothing was dropped.
+    """
+    if len(num_cols) <= CORRELATION_COLUMN_CAP:
+        return num_cols, ""
+
+    variances = df[num_cols].var(numeric_only=True)
+    keep = set(variances.sort_values(ascending=False)
+               .head(CORRELATION_COLUMN_CAP).index)
+    cols = [c for c in num_cols if c in keep]      # original order
+    dropped = [c for c in num_cols if c not in keep]
+    note = (
+        f"*Showing the {len(cols)} highest-variance numeric columns of "
+        f"{len(num_cols)} — a full matrix would be unreadable. "
+        f"**{len(dropped)} column(s) are not shown**, so absence of a "
+        f"high-correlation pair below is not evidence there is none: "
+        f"{', '.join(dropped[:8])}{' …' if len(dropped) > 8 else ''}.*"
+    )
+    return cols, note
+
+
 def render_correlations(df: pd.DataFrame) -> None:
     num_cols = _numeric_cols(df)
     if len(num_cols) < 2:
         gr.Markdown("*Need ≥ 2 numeric columns for a correlation matrix.*")
         return
 
-    # Cap to a workable size; wide post-matminer frames would be unreadable.
-    cap = 30
-    capped = len(num_cols) > cap
-    cols = num_cols[:cap]
-    if capped:
-        gr.Markdown(
-            f"*Showing the first {cap} numeric columns (dataset has "
-            f"{len(num_cols)}). Run on raw pre-featurization data for a fuller view.*"
-        )
+    cols, cap_note = _correlation_columns(df, num_cols)
+    if cap_note:
+        gr.Markdown(cap_note)
 
     with gr.Row():
         method = gr.Radio(
