@@ -28,6 +28,11 @@ data/pdh_ACSMaterialsLetters.csv
 # publisher's copyright. Cite via reference_doi in the CSV instead.
 literatures/
 
+# Slide decks and other local presentation material. Kept alongside the code
+# while writing talks, but not part of the repository — they go stale against
+# the pipeline and bloat clones.
+*.pptx
+
 # Editor / OS junk
 .DS_Store
 .vscode/
