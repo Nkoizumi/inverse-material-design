@@ -25,6 +25,15 @@ PRESETS = {
     # Library trimmed to a fast-demo size: 4 metals × 4 promoters × 4 promoters
     # × 4 supports × 4×2×2 loadings ≈ 8k catalysts (vs the default 100k), so
     # the whole pipeline runs in ~1 min for the README quick-start.
+    #
+    # NOTE: featurization is no longer the reason to trim. Since the
+    # featurizers resolve distinct cell values once, the full 101,816-row
+    # library featurizes in ~6 s (was ~11 min). What now dominates a
+    # full-library run is the discrete acquisition — optimize_acqf_discrete
+    # over 100k choices with q = BO_BATCH_SIZE × BO_UNIQUE_OVERSAMPLE takes
+    # ~4-5 min. Widen the library freely if you can spend that; installing
+    # `ninja` lets BoTorch compile its fused qLogEHVI kernel for a further
+    # ~3× on the multi-objective path.
     "synthetic_catalyst": {
         "DATASET_SOURCE": "csv",
         "CSV_PATH": Path(__file__).parent / "data" / "synthetic_catalysts.csv",

@@ -127,6 +127,23 @@ Everything is in `config.py`. Key knobs:
 Presets in `run_pipeline.py` override these in-process — see the `PRESETS`
 dict for exact settings.
 
+## Performance notes
+
+The catalyst featurizers resolve each **distinct** cell value once and
+broadcast the result, which matters because a BO library is a Cartesian
+product: the default 101,816-row role-based library contains only 11 distinct
+active metals, 5 promoter-1 values, 6 promoter-2 values and 26 supports.
+
+| stage | time |
+|---|---|
+| role-based library, 101,816 rows | ~6 s |
+| atomic-fraction library, 10,000 rows | ~6 s |
+| discrete acquisition over 100k choices (q=80, MOBO) | ~4–5 min |
+
+Featurization is therefore no longer what limits library size — the discrete
+acquisition is. Installing `ninja` lets BoTorch compile its fused qLogEHVI
+kernel for a further ~3× on the multi-objective path.
+
 ## Tests
 
 ```bash

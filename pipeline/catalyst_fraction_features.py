@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from catalyst_features import weighted_lookup
+from catalyst_features import LookupIndex, weighted_lookup
 
 log = logging.getLogger(__name__)
 
@@ -191,13 +191,16 @@ def _join_support_lookup(df: pd.DataFrame, oxide_col: str,
                 if c != key_col and not pd.api.types.is_numeric_dtype(lookup_df[c])
                 and c != "pymatgen_formula"]
 
-    rows = []
-    for oxide in df[oxide_col]:
-        if pd.isna(oxide):
-            rows.append({})
-        else:
-            rows.append(weighted_lookup({str(oxide): 1.0}, lookup_df, key_col,
-                                         numeric_cols, cat_cols))
+    # There are only a handful of distinct supports (one per entry in
+    # CATALYST_FRACTION_SUPPORT_OXIDE_MAP), so resolve each once instead of
+    # re-scanning the lookup table for all N rows.
+    index = LookupIndex.build(lookup_df, key_col, numeric_cols, cat_cols)
+    by_oxide = {
+        oxide: weighted_lookup({str(oxide): 1.0}, lookup_df, key_col,
+                               numeric_cols, cat_cols, index=index)
+        for oxide in df[oxide_col].dropna().unique()
+    }
+    rows = [{} if pd.isna(oxide) else by_oxide[oxide] for oxide in df[oxide_col]]
     sup_feats = pd.DataFrame(rows).add_prefix(f"{prefix}_")
     df = pd.concat([df.reset_index(drop=True),
                     sup_feats.reset_index(drop=True)], axis=1)
@@ -225,20 +228,35 @@ def _join_metal_lookup_weighted(df: pd.DataFrame, element_cols: list[str],
                 if c != key_col and not pd.api.types.is_numeric_dtype(lookup_df[c])]
 
     metal_elements = [e for e in element_cols if e not in support_cations]
+    # Columns absent from df contributed nothing under the old `row.get(e)`
+    # (None → skipped), so dropping them here is equivalent. Order is
+    # preserved because the categorical major-component vote breaks ties on
+    # dict insertion order.
+    present = [e for e in metal_elements if e in df.columns]
+
+    # Resolve the lookup ONCE. Building it per row (which is what calling
+    # weighted_lookup without an index does) dominated the whole fraction-mode
+    # featurizer: 4.6 s of 8.6 s on a 1500-row library.
+    index = LookupIndex.build(lookup_df, key_col, numeric_cols, cat_cols)
+
+    # `.astype(float)` rather than to_numeric(errors="coerce") so malformed
+    # cells still raise, exactly as the old `float(v)` did.
+    values = (df[present].astype(float).to_numpy()
+              if present else np.empty((len(df), 0)))
 
     rows = []
-    for _, row in df.iterrows():
-        weights = {}
-        for e in metal_elements:
-            v = row.get(e)
-            if pd.notna(v) and float(v) > 0:
-                weights[e] = float(v)
+    for i in range(len(df)):
+        row_vals = values[i]
+        # NaN > 0 is False, so this also drops the missing cells the old
+        # `pd.notna(v) and float(v) > 0` test rejected.
+        weights = {present[j]: float(row_vals[j])
+                   for j in range(len(present)) if row_vals[j] > 0}
         # Renormalize so the lookup gets a probability distribution.
         total = sum(weights.values())
         if total > 0:
             weights = {k: v / total for k, v in weights.items()}
         rows.append(weighted_lookup(weights, lookup_df, key_col,
-                                     numeric_cols, cat_cols))
+                                     numeric_cols, cat_cols, index=index))
     metal_feats = pd.DataFrame(rows).add_prefix(f"{prefix}_")
     df = pd.concat([df.reset_index(drop=True),
                     metal_feats.reset_index(drop=True)], axis=1)
