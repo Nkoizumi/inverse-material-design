@@ -62,6 +62,9 @@ def main() -> int:
     config.CV_FOLDS = 2
     config.BNN_TRAINING_ITERS = 200
 
+    from config_schema import check
+    check(config)
+
     from step1_load import load_dataset
     from step2_featurize import featurize
     from step4_surrogate import fit_surrogates
