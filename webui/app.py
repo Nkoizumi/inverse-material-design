@@ -282,7 +282,7 @@ def run_pipeline(
             config.CSV_PATH = Path(file_obj.name)
 
         if not target_cols:
-            yield log("Pick at least one target column."), None, None, pd.DataFrame()
+            yield log("Pick at least one target column."), None, None, pd.DataFrame(), None
             return
 
         # Decide which featurizer step 2 will dispatch to, from the CSV itself.
@@ -293,7 +293,7 @@ def run_pipeline(
         try:
             header = pd.read_csv(config.CSV_PATH, nrows=0).columns
         except Exception as e:
-            yield log(f"Could not read `{config.CSV_PATH}`: {e}"), None, None, pd.DataFrame()
+            yield log(f"Could not read `{config.CSV_PATH}`: {e}"), None, None, pd.DataFrame(), None
             return
         schema = detect_schema(header)
         _apply_schema_mode(schema)
@@ -331,16 +331,16 @@ def run_pipeline(
             from config_schema import check as _check_config
             _check_config(config)
         except ValueError as e:
-            yield log(str(e)), None, None, pd.DataFrame()
+            yield log(str(e)), None, None, pd.DataFrame(), None
             return
 
         progress(0.05, desc="Step 1 — load CSV")
         df = step1_load.load_dataset()
-        yield log(f"Loaded {len(df)} rows."), None, None, pd.DataFrame()
+        yield log(f"Loaded {len(df)} rows."), None, None, pd.DataFrame(), None
 
         progress(0.20, desc="Step 2 — featurize")
         df = step2_featurize.featurize(df)
-        yield log(f"Featurized → {df.shape[1]} columns."), None, None, pd.DataFrame()
+        yield log(f"Featurized → {df.shape[1]} columns."), None, None, pd.DataFrame(), None
 
         # If Tab 2 produced a transformed dataframe, swap it in for the surrogate.
         # Sanity-check: targets present + row count match. If anything looks off,
@@ -377,18 +377,18 @@ def run_pipeline(
                 f"({'role-based' if config.CATALYST_MODE else 'atomic-fraction'}). "
                 "Catalyst BO uses the raw featurized df (step4 caps features "
                 f"at MAX_GP_FEATURES={getattr(config, 'MAX_GP_FEATURES', None)})."
-            ), None, None, pd.DataFrame()
+            ), None, None, pd.DataFrame(), None
         elif transformed_df is not None and isinstance(transformed_df, pd.DataFrame):
             missing = [t for t in target_cols if t not in transformed_df.columns]
             if missing:
                 yield log(
                     f"Tab 2 transformed df ignored: missing target(s) {missing}."
-                ), None, None, pd.DataFrame()
+                ), None, None, pd.DataFrame(), None
             elif len(transformed_df) != len(df):
                 yield log(
                     f"Tab 2 transformed df ignored: row mismatch "
                     f"(tdf={len(transformed_df)}, raw={len(df)})."
-                ), None, None, pd.DataFrame()
+                ), None, None, pd.DataFrame(), None
             else:
                 df = transformed_df
                 pipeline_ = getattr(eda_obj, "pipeline_", None) if eda_obj else None
@@ -396,41 +396,44 @@ def run_pipeline(
                 yield log(
                     f"Using Tab 2 transformed features ({df.shape[1]} cols, "
                     f"transformer={'live' if transformer is not None else 'missing'})."
-                ), None, None, pd.DataFrame()
+                ), None, None, pd.DataFrame(), None
 
         progress(0.40, desc="Step 3 — auto-EDA")
         if eda_obj is not None and getattr(eda_obj, "pipeline_", None) is not None:
             yield log("Step 3 skipped: Tab 2 already produced a fitted EDA pipeline."), \
-                None, None, pd.DataFrame()
+                None, None, pd.DataFrame(), None
         else:
             try:
                 step3_eda.run_eda(df)
-                yield log("Auto-EDA complete."), None, None, pd.DataFrame()
+                yield log("Auto-EDA complete."), None, None, pd.DataFrame(), None
             except Exception as e:
-                yield log(f"Auto-EDA skipped ({e})."), None, None, pd.DataFrame()
+                yield log(f"Auto-EDA skipped ({e})."), None, None, pd.DataFrame(), None
 
         progress(0.55, desc="Step 4 — fit surrogates")
         surrogates = step4_surrogate.fit_surrogates(df)
-        yield log("Surrogate(s) fit."), None, None, pd.DataFrame()
+        yield log("Surrogate(s) fit."), None, None, pd.DataFrame(), None
 
         progress(0.75, desc="Step 5 — BO / MOBO")
         candidates = step5_inverse.run_inverse(df, surrogates, transformer=transformer)
-        yield log(f"BO selected {len(candidates)} candidates."), None, None, pd.DataFrame()
+        yield log(f"BO selected {len(candidates)} candidates."), None, None, pd.DataFrame(), None
 
         progress(0.90, desc="Step 6 — report (LLM narrative + per-figure captions)")
         bundle = step6_report.generate_report_bundle(candidates)
 
         progress(1.0, desc="done")
+        # Snapshot now, while config still holds THIS run's values.
+        run_cfg = capture_run_config()
         yield (
             log(f"Done in {len(log_lines)} steps. Report at {bundle.path}."),
             bundle,
             str(bundle.path),
             candidates,
+            run_cfg,
         )
 
     except Exception as e:
         tb = traceback.format_exc()
-        yield log(f"FAILED: {e}\n\n```\n{tb}\n```"), None, None, pd.DataFrame()
+        yield log(f"FAILED: {e}\n\n```\n{tb}\n```"), None, None, pd.DataFrame(), None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -488,21 +491,18 @@ def _split_narrative_around_figures(narrative: str, figures) -> list[tuple[str, 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tab 4 — explore candidates
 # ─────────────────────────────────────────────────────────────────────────────
-def _is_fraction_schema(df: pd.DataFrame) -> bool:
+def _is_fraction_schema(df: pd.DataFrame, run_cfg: dict | None = None) -> bool:
     """Detect atomic-fraction candidates: no role columns, has element columns."""
     if df is None or len(df) == 0:
         return False
     if "active_metal" in df.columns:
         return False
-    try:
-        import config as _cfg
-        elems = getattr(_cfg, "CATALYST_FRACTION_ELEMENTS", [])
-    except Exception:
-        elems = []
+    elems = _from_run(run_cfg, "CATALYST_FRACTION_ELEMENTS")
     return bool(elems) and any(e in df.columns for e in elems)
 
 
-def candidate_detail(candidates_df: pd.DataFrame, selected_index: int):
+def candidate_detail(candidates_df: pd.DataFrame, selected_index: int,
+                     run_cfg: dict | None = None):
     """Show full property tables for the selected candidate row."""
     if candidates_df is None or len(candidates_df) == 0:
         return "Run the pipeline first."
@@ -512,11 +512,10 @@ def candidate_detail(candidates_df: pd.DataFrame, selected_index: int):
 
     # Atomic-fraction schema: render composition string + reaction conditions
     # + predictions. Skip the role-based lookup enrichment (not applicable).
-    if _is_fraction_schema(candidates_df):
-        import config as _cfg
-        elems = getattr(_cfg, "CATALYST_FRACTION_ELEMENTS", [])
-        supports = set(getattr(_cfg, "CATALYST_FRACTION_SUPPORT_CATIONS", []))
-        conds = getattr(_cfg, "CATALYST_FRACTION_CONDITIONS", [])
+    if _is_fraction_schema(candidates_df, run_cfg):
+        elems = _from_run(run_cfg, "CATALYST_FRACTION_ELEMENTS")
+        supports = set(_from_run(run_cfg, "CATALYST_FRACTION_SUPPORT_CATIONS"))
+        conds = _from_run(run_cfg, "CATALYST_FRACTION_CONDITIONS")
         # Dominant support = argmax over support cations present in row
         sup_frac = {s: float(row.get(s, 0.0)) for s in supports if s in row}
         sup_str = ""
@@ -575,7 +574,48 @@ def candidate_detail(candidates_df: pd.DataFrame, selected_index: int):
     return "\n".join(parts)
 
 
-def _sort_ascending_for(col: str) -> bool:
+def capture_run_config() -> dict:
+    """Snapshot the config values Tab 5 needs to render a finished run.
+
+    Tab 5's events (`_update_explore`, `filter_candidates`, `candidate_detail`)
+    read `config.TARGET_COLS`, `OPTIMIZATION_DIRECTIONS` and the fraction
+    element lists. Those are module globals that the NEXT run mutates.
+
+    Gradio serializes `run_pipeline` across sessions — its default
+    concurrency_limit resolves to 1 — so two runs cannot interleave and corrupt
+    a surrogate. But the Tab 5 events have their own concurrency ids and can
+    execute while another session's run is in flight, so they could read that
+    run's directions and sort somebody else's candidate table by them. The
+    effect is display-only; it cannot reach a surrogate or a report.
+
+    Snapshotting at the moment the candidates are produced means Tab 5 renders
+    the run it is showing rather than whatever ran last.
+    """
+    return {
+        "TARGET_COLS": list(getattr(config, "TARGET_COLS", [])),
+        "OPTIMIZATION_DIRECTIONS": list(getattr(config, "OPTIMIZATION_DIRECTIONS", [])),
+        "CATALYST_FRACTION_ELEMENTS": list(
+            getattr(config, "CATALYST_FRACTION_ELEMENTS", [])),
+        "CATALYST_FRACTION_SUPPORT_CATIONS": list(
+            getattr(config, "CATALYST_FRACTION_SUPPORT_CATIONS", [])),
+        "CATALYST_FRACTION_CONDITIONS": list(
+            getattr(config, "CATALYST_FRACTION_CONDITIONS", [])),
+    }
+
+
+def _from_run(run_cfg: dict | None, key: str):
+    """Read `key` from a captured run config, falling back to ambient config.
+
+    The fallback keeps every entry point working — direct calls, tests, and a
+    session whose candidates predate this snapshot — without each caller having
+    to care which it got.
+    """
+    if run_cfg and key in run_cfg:
+        return run_cfg[key]
+    return getattr(config, key, [])
+
+
+def _sort_ascending_for(col: str, run_cfg: dict | None = None) -> bool:
     """Should `col` sort ascending to put the BEST candidates first?
 
     This tab exists to hand candidates to an experimentalist, so "first row"
@@ -589,8 +629,8 @@ def _sort_ascending_for(col: str) -> bool:
       * an uncertainty column (`*_sd`)          -> ascending (tighter is better)
       * everything else                         -> descending
     """
-    targets = list(getattr(config, "TARGET_COLS", []))
-    directions = list(getattr(config, "OPTIMIZATION_DIRECTIONS", []))
+    targets = _from_run(run_cfg, "TARGET_COLS")
+    directions = _from_run(run_cfg, "OPTIMIZATION_DIRECTIONS")
     direction_of = dict(zip(targets, directions))
 
     if col.endswith("_sd"):
@@ -604,7 +644,8 @@ def _sort_ascending_for(col: str) -> bool:
     return direction_of.get(name, "max") == "min"
 
 
-def filter_candidates(candidates_df, metal_filter, support_filter, sort_col):
+def filter_candidates(candidates_df, metal_filter, support_filter, sort_col,
+                      run_cfg: dict | None = None):
     if candidates_df is None or len(candidates_df) == 0:
         return pd.DataFrame()
     out = candidates_df.copy()
@@ -615,7 +656,8 @@ def filter_candidates(candidates_df, metal_filter, support_filter, sort_col):
     if support_filter and "support" in out.columns:
         out = out[out["support"].isin(support_filter)]
     if sort_col and sort_col in out.columns:
-        out = out.sort_values(sort_col, ascending=_sort_ascending_for(sort_col))
+        out = out.sort_values(sort_col,
+                              ascending=_sort_ascending_for(sort_col, run_cfg))
     return out
 
 
@@ -641,6 +683,9 @@ with gr.Blocks(title="Inverse Material Design") as demo:
     )
 
     candidates_state = gr.State(pd.DataFrame())
+    # Config as it stood when those candidates were produced, so Tab 5
+    # renders the run it is showing rather than whatever ran last.
+    run_config_state = gr.State(None)
     bundle_state = gr.State(None)   # ReportBundle from step6 (or None)
     df_state = gr.State(None)       # raw loaded df (drives the EDA tab)
     default_target_state = gr.State(None)  # first numeric col, default for LLM tab
@@ -837,7 +882,8 @@ with gr.Blocks(title="Inverse Material Design") as demo:
                     surrogate_in, batch_in, llm_models_in,
                     transformed_state, eda_pipeline_state,
                 ],
-                outputs=[run_log, bundle_state, report_file, candidates_state],
+                outputs=[run_log, bundle_state, report_file,
+                         candidates_state, run_config_state],
             )
 
         # ── Tab 5: Explore ──────────────────────────────────────────────
@@ -875,33 +921,34 @@ with gr.Blocks(title="Inverse Material Design") as demo:
             #    this fired repeatedly mid-run and blanked the dropdown. An
             #    empty frame now leaves both widgets untouched (gr.skip) rather
             #    than clearing them.
-            def _update_explore(df):
+            def _update_explore(df, run_cfg):
                 if df is None or len(df) == 0:
                     return gr.skip(), gr.skip()
-                target_cols = tuple(getattr(config, "TARGET_COLS", []))
+                target_cols = tuple(_from_run(run_cfg, "TARGET_COLS"))
                 cols = [c for c in df.columns
                         if c.startswith("pred_") or c in target_cols]
                 # Default to the primary target's prediction so the first thing
                 # shown is ranked best-first rather than in acquisition order.
                 default = cols[0] if cols else None
-                shown = (filter_candidates(df, None, None, default)
+                shown = (filter_candidates(df, None, None, default, run_cfg)
                          if default else df)
                 return shown, gr.update(choices=cols, value=default)
 
             candidates_state.change(
-                _update_explore, inputs=[candidates_state],
+                _update_explore, inputs=[candidates_state, run_config_state],
                 outputs=[candidate_table, sort_in],
             )
 
             filter_btn.click(
                 filter_candidates,
-                inputs=[candidates_state, metal_filter, support_filter, sort_in],
+                inputs=[candidates_state, metal_filter, support_filter, sort_in,
+                        run_config_state],
                 outputs=[candidate_table],
             )
 
             detail_btn.click(
                 candidate_detail,
-                inputs=[candidates_state, row_idx],
+                inputs=[candidates_state, row_idx, run_config_state],
                 outputs=[candidate_detail_md],
             )
 
