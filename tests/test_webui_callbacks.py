@@ -256,6 +256,92 @@ def test_row_alignment_refuses_on_any_row_count_change(before, after):
     assert "wrong catalyst" in msg
 
 
+# ── Tab 5 renders the run it is showing, not whatever ran last ───────────────
+# Gradio serializes run_pipeline (default concurrency_limit resolves to 1), so
+# two runs cannot interleave and corrupt a surrogate. But Tab 5's events have
+# their own concurrency ids and CAN execute while another session's run is in
+# flight, reading that run's TARGET_COLS / OPTIMIZATION_DIRECTIONS. Display
+# only — but it means one session's table could be sorted by another's
+# directions.
+def test_capture_run_config_snapshots_the_current_values(monkeypatch):
+    monkeypatch.setattr(config, "TARGET_COLS", ["a", "b"])
+    monkeypatch.setattr(config, "OPTIMIZATION_DIRECTIONS", ["max", "min"])
+    snap = app.capture_run_config()
+    assert snap["TARGET_COLS"] == ["a", "b"]
+    assert snap["OPTIMIZATION_DIRECTIONS"] == ["max", "min"]
+
+
+def test_captured_config_is_a_copy_not_a_live_reference(monkeypatch):
+    """A reference would track the next run's mutations and defeat the point."""
+    monkeypatch.setattr(config, "TARGET_COLS", ["a"])
+    snap = app.capture_run_config()
+    config.TARGET_COLS.append("b")          # mutate the list in place
+    assert snap["TARGET_COLS"] == ["a"]
+
+
+def test_sort_uses_the_captured_config_over_ambient(monkeypatch):
+    """The property this exists for: session A's directions survive session B
+    rewriting the globals."""
+    captured = {"TARGET_COLS": ["deactivation_rate_log"],
+                "OPTIMIZATION_DIRECTIONS": ["min"]}
+    # Session B's run has since rewritten the module globals.
+    monkeypatch.setattr(config, "TARGET_COLS", ["propane_TOF_log"])
+    monkeypatch.setattr(config, "OPTIMIZATION_DIRECTIONS", ["max"])
+
+    assert app._sort_ascending_for("pred_deactivation_rate_log", captured) is True
+    # Without the capture it reads the other session's config and gets it wrong.
+    assert app._sort_ascending_for("pred_deactivation_rate_log") is False
+
+
+def test_filter_candidates_honours_the_captured_config(monkeypatch):
+    captured = {"TARGET_COLS": ["deactivation_rate_log"],
+                "OPTIMIZATION_DIRECTIONS": ["min"]}
+    monkeypatch.setattr(config, "TARGET_COLS", ["other"])
+    monkeypatch.setattr(config, "OPTIMIZATION_DIRECTIONS", ["max"])
+    df = pd.DataFrame({"active_metal": ["Pt", "Pd", "Rh"],
+                       "pred_deactivation_rate_log": [-1.0, -3.0, -2.0]})
+    out = app.filter_candidates(df, None, None, "pred_deactivation_rate_log", captured)
+    assert out.iloc[0]["active_metal"] == "Pd"      # -3.0, best for a min target
+
+
+def test_candidate_detail_honours_the_captured_element_panel(monkeypatch):
+    captured = {"CATALYST_FRACTION_ELEMENTS": ["Al", "Ga", "Pt"],
+                "CATALYST_FRACTION_SUPPORT_CATIONS": ["Al"],
+                "CATALYST_FRACTION_CONDITIONS": []}
+    monkeypatch.setattr(config, "CATALYST_FRACTION_ELEMENTS", [])   # session B
+    df = pd.DataFrame({"Al": [0.95], "Ga": [0.03], "Pt": [0.02],
+                       "pred_propylene_yield": [0.42]})
+    md = app.candidate_detail(df, 0, captured)
+    assert "Al(sup)" in md and "Ga=" in md
+
+
+def test_from_run_falls_back_to_ambient(monkeypatch):
+    """Candidates produced before this snapshot existed still render."""
+    monkeypatch.setattr(config, "TARGET_COLS", ["ambient"])
+    assert app._from_run(None, "TARGET_COLS") == ["ambient"]
+    assert app._from_run({}, "TARGET_COLS") == ["ambient"]
+    assert app._from_run({"TARGET_COLS": ["captured"]}, "TARGET_COLS") == ["captured"]
+
+
+def test_every_run_pipeline_yield_matches_the_declared_output_count():
+    """Generalises W1 to the generator. Adding an output means editing 16
+    yields; one missed and Gradio raises on arity mid-run, after the pipeline
+    has already done its work."""
+    import ast
+    import inspect
+
+    src = inspect.getsource(app)
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "run_pipeline")
+    arities = {len(y.value.elts) if isinstance(y.value, ast.Tuple) else 1
+               for y in ast.walk(fn) if isinstance(y, ast.Yield)}
+    assert arities == {5}, (
+        f"run_pipeline yields tuples of differing length {sorted(arities)}; "
+        f"every yield must match the 5 declared outputs "
+        f"(run_log, bundle_state, report_file, candidates_state, run_config_state)"
+    )
+
+
 # ── R1: the correlation heatmap's column cap ─────────────────────────────────
 def test_no_cap_note_when_everything_fits():
     df = pd.DataFrame({f"c{i}": [1.0, 2.0, 3.0] for i in range(5)})
