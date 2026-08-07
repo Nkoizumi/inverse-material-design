@@ -7,7 +7,7 @@ directly).
 
 Figure IDs used downstream:
     "pareto"             — training Pareto + BO candidates
-    "feature_importance" — XGBoost-gain bars per target
+    "feature_importance" — held-out permutation-importance bars per target
     "gp_vs_bnn"          — GP vs Bayesian-NN scatter
     "candidate_heatmap"  — top-candidate property heatmap
 """
@@ -146,7 +146,14 @@ def make_feature_importance_figure(
         names = [_short_name(e["feature"], 50) for e in entries][::-1]
         imps = [e["importance"] for e in entries][::-1]
         full_names = [e["feature"] for e in entries][::-1]
-        hover = [f"{n}<br>importance: {v:.4f}" for n, v in zip(full_names, imps)]
+        # Surface the fold stability in the tooltip: a feature that topped one
+        # fold out of five reads identically to one that topped all five
+        # unless the hover says so.
+        stab = [(f"<br>stable in {e['folds_in_top_k']}/{e['n_folds']} CV folds"
+                 if e.get("n_folds") else "")
+                for e in entries][::-1]
+        hover = [f"{n}<br>importance: {v:.4f}{k}"
+                 for n, v, k in zip(full_names, imps, stab)]
 
         fig.add_trace(
             go.Bar(
