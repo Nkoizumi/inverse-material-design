@@ -238,6 +238,37 @@ def test_role_upload_is_not_flagged():
     assert "minimal report" not in msg
 
 
+# ── W9: only numeric columns may be offered as targets ───────────────────────
+def test_target_choices_exclude_non_numeric_columns():
+    """A text column picked as a target failed minutes later inside prepare_xy
+    rather than at the point of the mistake."""
+    _preview, choices, _msg, df, *_ = app.load_csv(None, use_synthetic=True)
+    offered = set(choices["choices"] if isinstance(choices, dict)
+                  else choices.constructor_args["choices"])
+    numeric = set(df.select_dtypes(include="number").columns)
+    non_numeric = set(df.columns) - numeric
+    assert non_numeric, "fixture has no non-numeric columns; test is vacuous"
+    assert offered <= numeric
+    assert not (offered & non_numeric)
+
+
+# ── W10: minimize picks reset when the target set changes ────────────────────
+def test_sync_targets_clears_stale_minimize_selection():
+    """A stale minimize tick against a target no longer selected would drop
+    silently out of OPTIMIZATION_DIRECTIONS."""
+    picked, update = app._sync_targets(["a", "b"])
+    assert picked == ["a", "b"]
+    args = update["choices"] if isinstance(update, dict) else update.constructor_args["choices"]
+    val = update["value"] if isinstance(update, dict) else update.constructor_args["value"]
+    assert list(args) == ["a", "b"]
+    assert val == []
+
+
+def test_sync_targets_handles_none():
+    picked, _ = app._sync_targets(None)
+    assert picked == []
+
+
 # ── W6: the composition line that never rendered ─────────────────────────────
 def test_candidate_detail_shows_composition():
     """The bug: this line read row['_label'], which step6 adds to its report

@@ -576,9 +576,20 @@ def render_llm_decisions(
         progress(0.9, desc="Rendering")
         gauge = _build_agreement_gauge(ens.agreement_score)
 
+        # Report the twin drops too. The guard silently removed columns the
+        # user can see in their own CSV (e.g. propane_conversion when
+        # optimizing propylene_yield), which looks like data loss unless it is
+        # named. See config.TARGET_TWINS for why they cannot stay.
+        twin_note = (
+            f"  \n**Target twins also excluded** (raw/log/algebraic siblings "
+            f"that would leak the target into the features): "
+            f"{', '.join(sorted(twin_drop))}"
+            if twin_drop else ""
+        )
         conf_md = (
             f"**Targets excluded from features**: "
-            f"{', '.join(all_targets)} (primary = `{primary}`)  \n"
+            f"{', '.join(all_targets)} (primary = `{primary}`)"
+            f"{twin_note}  \n"
             f"**Phi-4 confidence** {ens.phi4_decision.confidence:.0%}  ·  "
             f"latency {ens.phi4_decision.latency_ms:.0f} ms  \n"
             f"**Mistral confidence** {ens.mistral_decision.confidence:.0%}  ·  "
