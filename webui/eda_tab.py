@@ -29,13 +29,12 @@ from plotly.subplots import make_subplots
 
 log = logging.getLogger(__name__)
 
-# Make /home/nao/auto_eda's `pipeline` package importable. Step3 does the same;
-# both projects ship a `pipeline/` package but our local one is only imported
-# via flat modules (`import step1_load`), so the `pipeline.*` namespace stays
-# free for auto_eda's orchestrator and llm engine.
-_AUTO_EDA_PATH = "/home/nao/auto_eda"
-if _AUTO_EDA_PATH not in sys.path:
-    sys.path.insert(0, _AUTO_EDA_PATH)
+# NOTE: this module used to hardcode `sys.path.insert(0, "/home/nao/auto_eda")`
+# at import time. Two problems, both fixed by pipeline/auto_eda_bridge.py:
+# the path was the author's home directory, so Tab 2's LLM feature could not
+# work anywhere else; and the insert ran on IMPORT and was never removed, so
+# merely importing this module put the other project ahead of ours for the
+# whole process — and both repositories contain an `app.py`.
 
 
 # ─── theme: match the rest of the app (plotly_white, light) ──────────────────
@@ -624,10 +623,14 @@ def render_llm_decisions(
         primary = (selected_targets[0] if selected_targets else all_targets[0])
         try:
             progress(0.1, desc="Importing AutoEDAPipeline")
+            # Routed through the bridge so the path is resolved from config
+            # rather than hardcoded, and the sys.path change lasts only for
+            # the import.
+            from auto_eda_bridge import AutoEDAUnavailable, load as _load_auto_eda
             try:
-                from pipeline.orchestrator import AutoEDAPipeline   # noqa: WPS433
-            except Exception as e:
-                return (f"Could not import AutoEDAPipeline: {e}",
+                AutoEDAPipeline = _load_auto_eda("AutoEDAPipeline")
+            except AutoEDAUnavailable as e:
+                return (str(e),
                         None, "", pd.DataFrame(), pd.DataFrame(),
                         "", "", "", "", None, None, None)
 
