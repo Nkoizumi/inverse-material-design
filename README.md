@@ -67,6 +67,29 @@ preset with `--skip eda report`:
 Step 6's LLM narrative adds several minutes on top of both, depending on your
 Ollama model and hardware.
 
+**Ollama and step 5 share one GPU.** Step 6 is the last thing the pipeline
+does, and Ollama's default is to hold a model in VRAM for five minutes after it
+answers — so without care the model that wrote the report is still resident
+when your *next* run starts, and that run is the one that fails. This project
+therefore asks Ollama to unload the model as soon as the narrative is written
+(`REPORT_LLM_KEEP_ALIVE`, below).
+
+Step 5's acquisition peaks at only ~3.2 GB *allocated*, so roughly 4 GB free is
+enough. Note that `nvidia-smi` overstates this considerably — peak *reserved*
+reaches ~22 GB, because PyTorch's caching allocator grows to fill whatever is
+free and does not hand it back. Measured on a 24 GB card, `--preset acs_pdh`:
+
+| resident Ollama model | free VRAM | result |
+|---|---|---|
+| none | 23.3 GB | ok |
+| `phi4:14b-q4_K_M` (10 GB) | 13.4 GB | ok |
+| `qwen3:32b-q4_K_M` (20 GB) | 2.7 GB | CUDA OOM in step 5 |
+
+If you hit an OOM here, run `ollama ps` first: the question is what is resident
+and how much is free, not whether the pipeline is too big. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`,
+which the OOM message itself suggests, does not help — it trims allocator waste
+but cannot recover the missing gigabytes.
+
 The cost is `optimize_acqf_discrete` scoring an ~8k-row library at
 q = `BO_BATCH_SIZE` × `BO_UNIQUE_OVERSAMPLE` = 80. If you are CPU-bound and
 want a faster demo, lower `BO_UNIQUE_OVERSAMPLE` — it over-fetches so duplicate
@@ -155,6 +178,10 @@ Everything is in `config.py`. Key knobs:
 - `BO_MAX_PER_FAMILY` — family-diversity cap for the BO batch (default 4 for fraction mode; disabled for role-based).
 - `SURROGATE_KIND` — `gp` (default), `bnn`, or `both`.
 - `CV_FOLDS` — 5-fold CV for parity plots (0 to disable).
+- `REPORT_LLM_KEEP_ALIVE` — how long Ollama keeps the report model in VRAM
+  after step 6 (default `0` = unload immediately, so the next run gets the
+  GPU). Set `"5m"` to restore Ollama's default if you re-run reports
+  back-to-back and would rather spend VRAM than the ~10 s model reload.
 
 - `RANDOM_STATE` — seeds python / numpy / torch and the BO acquisition
   sampler. Two runs of the same preset select the same catalysts.
