@@ -175,7 +175,12 @@ Everything is in `config.py`. Key knobs:
 - `BNN_PREDICT_SAMPLES` — posterior draws per BNN prediction (default 512).
   This is the noise floor of every BNN number in the report; see the comment
   in `config.py` for the measurement behind the default.
-- `BO_MAX_PER_FAMILY` — family-diversity cap for the BO batch (default 4 for fraction mode; disabled for role-based).
+- `BO_MAX_PER_FAMILY` — family-diversity cap for the BO batch (default 4).
+  Family is the dominant non-support element in atomic-fraction mode and the
+  `active_metal` cell in role-based mode. Turn it off (`None`) for benchmark
+  runs: on training data dominated by one metal it will propose metals the
+  surrogate cannot predict, which is useful for hedging an experimental batch
+  and misleading as a measure of the optimizer.
 - `SURROGATE_KIND` — `gp` (default), `bnn`, or `both`.
 - `CV_FOLDS` — 5-fold CV for parity plots (0 to disable).
 - `REPORT_LLM_KEEP_ALIVE` — how long Ollama keeps the report model in VRAM

@@ -373,6 +373,81 @@ def _nearest_known(candidates: torch.Tensor, data: XYData, df: pd.DataFrame) -> 
 # ─────────────────────────────────────────────────────────────────────────────
 # Catalyst discrete path
 # ─────────────────────────────────────────────────────────────────────────────
+def _dedup_and_cap(ordered_idx: list[int], library_raw: pd.DataFrame,
+                   id_cols: list[str], q_target: int, *,
+                   family_cap: int = 0, family_col: str | None = None,
+                   q_ask: int | None = None, unique_oversample: int = 0,
+                   family_oversample: int = 0) -> list[int]:
+    """Pick `q_target` library rows from `ordered_idx` (best acquisition first).
+
+    Two filters, in order, both applied in a single pass:
+
+    1. **Dedup on displayed catalyst identity.** `optimize_acqf_discrete`'s
+       `unique=True` guarantees distinct choice *indices*, not distinct
+       catalysts: different library-tensor rows argmin back to the same
+       `library_raw` row when the featurizer makes them numerically
+       indistinguishable (empty-promoter loading variants). Without this, a
+       q=20 batch came back as 7 catalysts.
+
+    2. **Family cap** (optional). At most `family_cap` catalysts sharing a
+       `family_col` value. If that leaves the batch short, the remaining slots
+       are filled with the best-acquisition rows that dedup already accepted —
+       an under-filled batch is worse than a slightly less diverse one.
+
+    The fallback pool is every dedup survivor, not just the ones scanned before
+    the batch filled, which is why the loop keeps collecting after `kept` is
+    full.
+    """
+    seen: set = set()
+    unique_idx: list[int] = []      # dedup survivors, in acquisition order
+    kept: list[int] = []            # dedup survivors that also fit under the cap
+    counts: dict[str, int] = {}
+    over_cap = 0
+
+    for i in ordered_idx:
+        key = tuple(library_raw.iloc[i][k] for k in id_cols)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_idx.append(i)
+        if len(kept) >= q_target:
+            continue                # keep filling the fallback pool
+        if family_cap and family_col:
+            fam = str(library_raw.iloc[i][family_col]).strip() or "(none)"
+            if counts.get(fam, 0) >= family_cap:
+                over_cap += 1
+                continue
+            counts[fam] = counts.get(fam, 0) + 1
+        kept.append(i)
+
+    n_dupes = len(ordered_idx) - len(unique_idx)
+    if n_dupes:
+        log.info("Deduped %d duplicate catalyst identities from BO batch "
+                 "(fetched q=%s, kept %d unique).",
+                 n_dupes, q_ask, len(unique_idx))
+    if family_cap and family_col:
+        log.info("Family cap=%d applied on %s: %s (dropped %d over-cap).",
+                 family_cap, family_col, counts, over_cap)
+        if len(kept) < q_target:
+            log.warning("Family cap=%d left %d/%d slots empty after %d over-cap "
+                        "drops. Raise BO_FAMILY_OVERSAMPLE (currently %d) or "
+                        "lower the cap. Filling with best-acquisition.",
+                        family_cap, q_target - len(kept), q_target,
+                        over_cap, family_oversample)
+            chosen = set(kept)
+            for i in unique_idx:
+                if i in chosen:
+                    continue
+                kept.append(i)
+                if len(kept) >= q_target:
+                    break
+    if len(kept) < q_target:
+        log.warning("Only %d unique catalysts survived dedup (target %d). "
+                    "Raise BO_UNIQUE_OVERSAMPLE (currently %d) or widen the library.",
+                    len(kept), q_target, unique_oversample)
+    return kept
+
+
 def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
                             transformer=None) -> Selection:
     from catalyst_features import CatalystFeaturizer
@@ -448,36 +523,41 @@ def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
     # promoter-loading variants that are numerically indistinguishable.
     q_target = int(config.BO_BATCH_SIZE)
     oversample = int(getattr(config, "BO_UNIQUE_OVERSAMPLE", 4))
-    q_ask = min(q_target * oversample, X_lib_std.shape[0])
+    # Family cap needs its own headroom on top of the dedup headroom: dedup
+    # discards identity collisions, the cap then discards over-represented
+    # active metals, and both come out of the same fetched pool.
+    metal_col = config.CATALYST_ROLES.get("active_metal")
+    family_cap = int(getattr(config, "BO_MAX_PER_FAMILY", None) or 0)
+    if family_cap and metal_col not in library_raw.columns:
+        log.warning("BO_MAX_PER_FAMILY is set but the library has no %r column; "
+                    "skipping the family cap.", metal_col)
+        family_cap = 0
+    fam_oversample = int(getattr(config, "BO_FAMILY_OVERSAMPLE", 5)) if family_cap else 1
+    q_ask = min(q_target * oversample * fam_oversample, X_lib_std.shape[0])
     candidates_std = _select_discrete(acq, X_lib_std, q_ask)
 
     # 6. Recover library rows for selected candidates -------------------------
     selected_idx = _recover_library_rows(X_lib_std, candidates_std)
 
-    # 6a. Dedup on displayed catalyst identity, cap at q_target.
+    # 6a. Dedup on displayed catalyst identity, then optionally cap how many
+    # catalysts may share an active metal. Family = active_metal alone, the
+    # role-based analogue of fraction mode's dominant non-support element, so
+    # BO_MAX_PER_FAMILY means the same thing on both paths.
+    #
+    # Note what this buys and what it costs: on training data dominated by one
+    # metal (pdh_literature is 88% Pt) the cap forces candidates whose metal the
+    # surrogate has no signal for. That is diversity for hedging, not confidence
+    # — the predictions on those rows carry honestly-large sigma. Leave the cap
+    # off for benchmark runs where BO should exploit unrestricted.
     id_cols = [c for c in
                list(config.CATALYST_ROLES.values()) + list(config.CATALYST_LOADINGS.values())
                if c in library_raw.columns]
-    seen: set = set()
-    unique_idx: list[int] = []
-    for i in selected_idx:
-        key = tuple(library_raw.iloc[i][k] for k in id_cols)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_idx.append(i)
-        if len(unique_idx) >= q_target:
-            break
-    n_dupes = len(selected_idx) - len(unique_idx)
-    if n_dupes:
-        log.info("Deduped %d duplicate catalyst identities from BO batch "
-                 "(fetched q=%d, kept %d unique).",
-                 n_dupes, q_ask, len(unique_idx))
-    if len(unique_idx) < q_target:
-        log.warning("Only %d unique catalysts survived dedup (target %d). "
-                    "Raise BO_UNIQUE_OVERSAMPLE (currently %d) or widen the library.",
-                    len(unique_idx), q_target, oversample)
-    selected_idx = unique_idx
+    selected_idx = _dedup_and_cap(
+        selected_idx, library_raw, id_cols, q_target,
+        family_cap=family_cap, family_col=metal_col,
+        q_ask=q_ask, unique_oversample=oversample,
+        family_oversample=fam_oversample,
+    )
 
     selected = library_raw.iloc[selected_idx].reset_index(drop=True)
 
