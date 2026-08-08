@@ -226,7 +226,13 @@ def test_the_agreement_block_carries_real_unicode_not_escapes(monkeypatch):
 
     class _FakeOllama:
         @staticmethod
-        def chat(model, messages, options=None):
+        def chat(model, messages, options=None, keep_alive=None):
+            # keep_alive is accepted but unused here: `_ask_ollama` passes it
+            # (main, #17) to unload the report model so the next run gets the
+            # GPU. A stub that refuses it raises TypeError, which `_ask_ollama`
+            # swallows into a placeholder narrative — so this test would fail on
+            # a missing `captured["prompt"]` and say nothing about the real
+            # cause. See tests/test_step6_ollama.py.
             captured["prompt"] = messages[0]["content"]
             return {"message": {"content": "narrative"}}
 
