@@ -523,9 +523,6 @@ def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
     # promoter-loading variants that are numerically indistinguishable.
     q_target = int(config.BO_BATCH_SIZE)
     oversample = int(getattr(config, "BO_UNIQUE_OVERSAMPLE", 4))
-    # Family cap needs its own headroom on top of the dedup headroom: dedup
-    # discards identity collisions, the cap then discards over-represented
-    # active metals, and both come out of the same fetched pool.
     metal_col = config.CATALYST_ROLES.get("active_metal")
     family_cap = int(getattr(config, "BO_MAX_PER_FAMILY", None) or 0)
     if family_cap and metal_col not in library_raw.columns:
@@ -533,7 +530,18 @@ def _run_catalyst_discrete(df: pd.DataFrame, data: XYData, surrogate,
                     "skipping the family cap.", metal_col)
         family_cap = 0
     fam_oversample = int(getattr(config, "BO_FAMILY_OVERSAMPLE", 5)) if family_cap else 1
-    q_ask = min(q_target * oversample * fam_oversample, X_lib_std.shape[0])
+    # max(), NOT the product. The two factors are sequential filters on one
+    # fetched pool, not independent requirements, and `optimize_acqf_discrete`
+    # is sequential-greedy: each of the q steps rescores every remaining choice,
+    # so cost grows worse than linearly in q. Multiplying them (20 x 4 x 5 = 400
+    # over a 101,816-row library) ran for over 55 minutes without finishing,
+    # against ~4-5 min at q=80 — and BO_MAX_PER_FAMILY defaults to 4, so that
+    # would have been the cost of an ordinary role-based run.
+    #
+    # A pool that is too thin does not fail: `_dedup_and_cap` tops the batch up
+    # from the dedup survivors and logs that it did. Trading a little diversity
+    # for an order of magnitude of wall time is the right side of that bargain.
+    q_ask = min(q_target * max(oversample, fam_oversample), X_lib_std.shape[0])
     candidates_std = _select_discrete(acq, X_lib_std, q_ask)
 
     # 6. Recover library rows for selected candidates -------------------------
