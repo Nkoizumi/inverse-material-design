@@ -86,6 +86,76 @@ def build_library(
     return df
 
 
+def build_scoring_library(train_df: "pd.DataFrame"):
+    """The library exactly as step 5 will score it: built, featurized, and with
+    reaction conditions filled from `train_df` medians.
+
+    Step 4 needs this to know which features can actually discriminate
+    candidates (see `dead_library_columns`), and step 5 needs it to score them.
+    Both call this so the two views cannot drift — the alternative, each
+    rebuilding its own, is how the `interfacial_`/`intf_` and duplicated-R²
+    bugs happened.
+
+    Returns ``(library_raw, library_feat)``.
+    """
+    import config
+    from catalyst_features import CatalystFeaturizer
+
+    sup_lookup = pd.read_csv(config.SUPPORT_LOOKUP_PATH)
+    library_raw = build_library(
+        supports=sup_lookup["support"].tolist(),
+        role_cols=config.CATALYST_ROLES,
+        loading_cols=config.CATALYST_LOADINGS,
+        active_metals=getattr(config, "LIBRARY_ACTIVE_METALS", None),
+        promoters_1=getattr(config, "LIBRARY_PROMOTERS_1", None),
+        promoters_2=getattr(config, "LIBRARY_PROMOTERS_2", None),
+        metal_loadings=getattr(config, "LIBRARY_METAL_LOADINGS", None),
+        promo_loadings=getattr(config, "LIBRARY_PROMO_LOADINGS", None),
+    )
+    library_feat = CatalystFeaturizer(
+        roles=config.CATALYST_ROLES,
+        loadings=config.CATALYST_LOADINGS,
+        support_lookup_path=config.SUPPORT_LOOKUP_PATH,
+        metal_lookup_path=config.METAL_LOOKUP_PATH,
+        optional_numeric_features=getattr(config, "OPTIONAL_NUMERIC_FEATURES", []),
+    ).fit_transform(library_raw)
+
+    # Same training-median fill step 5 applies (its block 2a). Kept here so the
+    # variance check sees the values that will actually be scored: a
+    # median-filled condition column is CONSTANT across the library, which is
+    # precisely what makes it useless for ranking candidates.
+    for col in list(getattr(config, "OPTIONAL_NUMERIC_FEATURES", [])):
+        if col in train_df.columns and train_df[col].notna().any():
+            library_feat[col] = float(pd.to_numeric(train_df[col],
+                                                    errors="coerce").median())
+            library_feat[f"{col}_present"] = 1
+
+    return library_raw, library_feat
+
+
+def dead_library_columns(library_feat: "pd.DataFrame") -> set[str]:
+    """Feature columns that take the SAME value for every library candidate.
+
+    Such a column cannot change the relative ranking of two candidates — it
+    shifts every prediction by the same amount — so spending part of the
+    `MAX_GP_FEATURES` budget on it is strictly wasted.
+
+    This is the mirror of the constant-in-TRAINING drop in `prepare_xy`, and it
+    matters just as much. Measured 2026-08-08 on pdh_literature: the Pearson-|r|
+    ranker spent 26 of its 30 slots on `range` / `avg_dev` / `p-norm` statistics
+    of `active_metal`, which are identically zero for any single-element
+    composition. They varied in training only because that column also holds
+    oxide phases (Cr2O3, Ga2O3, In2O3, Ga8Al2O15), so the ranker had really
+    selected an "is the active phase an oxide?" detector — a proxy for data
+    provenance. The library contains only pure metals, so all 26 were constant
+    across it, 101,816 candidates collapsed to 10 distinct feature vectors, and
+    promoters, support and loadings contributed nothing at all.
+    """
+    numeric = library_feat.select_dtypes(include="number")
+    nunique = numeric.nunique(dropna=False)
+    return set(nunique[nunique <= 1].index)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     import sys

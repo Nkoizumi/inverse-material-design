@@ -64,8 +64,15 @@ class XYData:
         return y_std * self.y_std + self.y_mean
 
 
-def prepare_xy(df: pd.DataFrame) -> XYData:
+def prepare_xy(df: pd.DataFrame,
+               dead_library_cols: set[str] | None = None) -> XYData:
     """Split features and targets, standardize both.
+
+    `dead_library_cols` are feature columns that take a single value across the
+    whole BO library. They are dropped before ranking: such a column shifts
+    every candidate's prediction identically and so cannot rank them, which
+    makes any slot it occupies in the MAX_GP_FEATURES budget wasted. Optional so
+    the non-catalyst paths and the tests can ignore it.
 
     Catalyst-mode features can have NaN for absent roles (e.g. promoter_2 empty).
     We drop columns that are entirely NaN, then impute remaining NaN with 0 — the
@@ -196,6 +203,29 @@ def prepare_xy(df: pd.DataFrame) -> XYData:
         keep_cols = [c for c in feature_cols if c not in set(const_cols)]
         work = work[keep_cols]
         feature_cols = keep_cols
+
+    # The mirror of the drop above, and just as necessary: a feature that is
+    # constant across the BO LIBRARY cannot change the relative ranking of two
+    # candidates, so ranking it into the budget is strictly wasted. Without
+    # this, the ranker spent 26 of 30 slots on active_metal range/avg_dev/norm
+    # statistics — identically zero for every single-element candidate — and
+    # 101,816 library rows collapsed onto 10 distinct feature vectors. See
+    # catalyst_library.dead_library_columns for the full diagnosis.
+    if dead_library_cols:
+        dead_here = [c for c in feature_cols if c in dead_library_cols]
+        if dead_here:
+            log.info("Dropping %d feature columns that are constant across the "
+                     "BO library (cannot rank candidates): %s%s",
+                     len(dead_here), dead_here[:5],
+                     " …" if len(dead_here) > 5 else "")
+            keep_cols = [c for c in feature_cols if c not in set(dead_here)]
+            if not keep_cols:
+                log.warning("Every candidate feature is constant across the BO "
+                            "library; keeping the training features instead so "
+                            "the surrogate can still be fit.")
+            else:
+                work = work[keep_cols]
+                feature_cols = keep_cols
 
     # Cap feature count by max |Pearson r| against any target. With small n
     # (catalyst data: ~60 rows) and ~500 features, the GP kernel collapses
@@ -564,13 +594,41 @@ class BNNSurrogate(Surrogate):
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
+def _dead_library_columns(df: pd.DataFrame) -> set[str]:
+    """Columns constant across the BO library, or an empty set if there is no
+    library to consult.
+
+    Computed ONCE per fit and reused for every CV fold. Which columns are
+    constant does not depend on the fold — a median-filled condition column is
+    a single value whichever fold's median it is — while rebuilding and
+    re-featurizing 101,816 rows per fold would not be free.
+
+    Any failure here degrades to "no library knowledge" rather than taking the
+    run down: the guardrail is an improvement to feature selection, not a
+    precondition for fitting a model.
+    """
+    if not getattr(config, "CATALYST_MODE", False):
+        return set()                     # only the role-based path has a library
+    if getattr(config, "CATALYST_FRACTION_MODE", False):
+        return set()                     # fraction libraries do not collapse
+    try:
+        from catalyst_library import build_scoring_library, dead_library_columns
+        _, library_feat = build_scoring_library(df)
+        return dead_library_columns(library_feat)
+    except Exception as e:               # pragma: no cover - defensive
+        log.warning("Could not inspect the BO library for constant features "
+                    "(%s); ranking without that guardrail.", e)
+        return set()
+
+
 def fit_surrogates(df: pd.DataFrame) -> dict:
     # Pin the global RNGs before any model is built: fit_gpytorch_mll, the SVGP
     # Adam loop and Pyro's AutoNormal guide all initialise from torch's global
     # RNG, so an unseeded run gives a different surrogate every time.
     seed_everything()
     _invalidate_parity_artifacts()
-    data = prepare_xy(df)
+    dead_library_cols = _dead_library_columns(df)
+    data = prepare_xy(df, dead_library_cols)
     out = {"data": data}
     kinds = _active_kinds()
 
@@ -593,7 +651,7 @@ def fit_surrogates(df: pd.DataFrame) -> dict:
     # plot without holding onto the live torch models. One row per training
     # sample, columns: true_<t>, gp_pred_<t>, gp_sd_<t>, [bnn_pred_<t>, bnn_sd_<t>].
     _save_training_predictions(data, out)
-    _save_cv_parity_predictions(df)
+    _save_cv_parity_predictions(df, dead_library_cols)
 
     # NOTE: this used to pickle the fitted surrogates to
     # CHECKPOINTS_DIR/surrogates.pkl. Nothing ever read that file — not step 5,
@@ -692,7 +750,8 @@ def _project_test(test_df: pd.DataFrame, train_data: XYData) -> tuple[torch.Tens
     return Xs, Y_true
 
 
-def _save_cv_parity_predictions(df: pd.DataFrame) -> None:
+def _save_cv_parity_predictions(df: pd.DataFrame,
+                                dead_library_cols: set[str] | None = None) -> None:
     """Run k-fold CV (config.CV_FOLDS) refitting each surrogate per fold and
     collect HELD-OUT predictions in original Y units. Saves to
     `data/cv_parity_predictions.parquet`. Skipped when CV_FOLDS is falsy.
@@ -731,7 +790,7 @@ def _save_cv_parity_predictions(df: pd.DataFrame) -> None:
         test_df = df.iloc[test_idx].reset_index(drop=True)
 
         try:
-            train_data = prepare_xy(train_df)
+            train_data = prepare_xy(train_df, dead_library_cols)
         except Exception as e:
             log.warning("Fold %d prepare_xy failed (%s); skipping fold.", fold_idx, e)
             continue
