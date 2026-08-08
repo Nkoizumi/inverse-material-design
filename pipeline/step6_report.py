@@ -234,6 +234,31 @@ def _enrich_candidate(row: dict, sup_lookup: pd.DataFrame,
     return enriched
 
 
+def _training_sample_count() -> int | None:
+    """How many rows the surrogate was actually fit on.
+
+    This used to report `config.SUBSAMPLE_N`, which is the *subsample-for-fast-
+    iteration* knob and is None whenever you are using the whole dataset — i.e.
+    normally. So every report said "Samples used: None". A scientific report
+    that cannot state its own sample size is worse than one that omits it.
+
+    `training_predictions.parquet` is the right source: step 4 writes exactly
+    one row per training sample, unconditionally, *after* the target-NaN drop.
+    That drop is why `raw.parquet` is only a fallback and not the first choice —
+    the PDH literature CSV loads 85 rows and fits 65 of them, and the honest
+    number is 65.
+    """
+    for name in ("training_predictions.parquet", "raw.parquet"):
+        path = config.DATA_DIR / name
+        if not path.exists():
+            continue
+        try:
+            return int(len(pd.read_parquet(path)))
+        except Exception as e:                      # pragma: no cover - IO edge
+            log.warning("Could not read %s for the sample count (%s).", name, e)
+    return None
+
+
 def _build_family(row: dict, sup_lookup: pd.DataFrame | None) -> str:
     """Chemistry-style descriptor used in the deterministic comparison table.
 
@@ -708,6 +733,7 @@ def generate_report_bundle(
         label_kind = "Catalyst"
     else:
         label_kind = "Composition"
+    n_samples = _training_sample_count()
     tmpl = Template(_TEMPLATE)
     md = tmpl.render(
         ts=ts_str,
@@ -716,7 +742,7 @@ def generate_report_bundle(
         label_kind=label_kind,
         schema_note=_FRACTION_SCHEMA_NOTE if is_fraction else "",
         targets=config.TARGET_COLS,
-        n_samples=config.SUBSAMPLE_N,
+        n_samples=n_samples,
         top_k=config.REPORT_TOP_K,
         eda_summary=eda_summary_str,
         candidates=enriched_records,
@@ -739,7 +765,7 @@ def generate_report_bundle(
                       if config.DATASET_SOURCE == "matminer"
                       else str(config.CSV_PATH)),
         targets=list(config.TARGET_COLS),
-        n_samples=config.SUBSAMPLE_N,
+        n_samples=n_samples,
         eda_summary_str=eda_summary_str,
         candidates_enriched=enriched_records,
         has_bnn=has_bnn,
