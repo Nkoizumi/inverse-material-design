@@ -137,10 +137,10 @@ atomic-fraction upload silently ran through the role-based featurizer.
   work through all tabs end-to-end.
 - **Atomic-fraction catalysts** (ACS PDH) now run correctly, with limits Tab 1
   states up front: Tab 3's library settings don't apply (the BO library is
-  sampled from your data), Tab 5's metal/support filters become no-ops, and
-  step 6 emits a **minimal report** — candidate table plus summary stats, no
-  LLM narrative or figures. A fraction-mode narrative / figure path is on the
-  roadmap.
+  sampled from your data) and Tab 5's metal/support filters become no-ops,
+  since this schema has no role columns to filter on. Step 6 writes the full
+  report — LLM narrative, per-candidate chemistry, and figures including a
+  metal-phase composition heatmap.
 
 ## Configuration
 
@@ -229,9 +229,12 @@ inverse_material_design/
 
 ## Known limitations
 
-- Atomic-fraction schema: web-UI Tab 5 (Explore) filters degrade to
-  no-ops; step 6 emits a minimal report (no LLM narrative or per-candidate
-  chemistry section).
+- Atomic-fraction schema: web-UI Tab 5 (Explore) filters degrade to no-ops.
+  The step-6 report reconstructs roles that the dataset does not label — the
+  support is inferred from the dominant Al/Si/Zr cation, and every other
+  element is folded into one composition-weighted metal phase. Those are the
+  same approximations the featurizer makes, so the report matches the model,
+  but neither resolves which element is catalytically active.
 - PDH literature dataset (n=85) is data-limited. Cannot separate
   composition from reaction conditions cleanly at this sample size. Use
   ACS (n=210) or wait for the DCP dataset for anything beyond exploration.

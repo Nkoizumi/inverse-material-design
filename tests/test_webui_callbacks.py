@@ -230,13 +230,13 @@ def test_fraction_upload_is_flagged_to_the_user(tmp_path):
 
     msg = app.load_csv(_F(), use_synthetic=False)[2]
     assert "atomic-fraction" in msg
-    assert "minimal report" in msg
+    assert "partially supported" in msg
 
 
 def test_role_upload_is_not_flagged():
     msg = app.load_csv(None, use_synthetic=True)[2]
     assert "role-based" in msg
-    assert "minimal report" not in msg
+    assert "partially supported" not in msg
 
 
 # ── W7: targets must never be paired to the wrong rows ───────────────────────
@@ -312,7 +312,7 @@ def test_candidate_detail_honours_the_captured_element_panel(monkeypatch):
     df = pd.DataFrame({"Al": [0.95], "Ga": [0.03], "Pt": [0.02],
                        "pred_propylene_yield": [0.42]})
     md = app.candidate_detail(df, 0, captured)
-    assert "Al(sup)" in md and "Ga=" in md
+    assert "Ga=" in md and "Al 0.95" in md
 
 
 def test_from_run_falls_back_to_ambient(monkeypatch):
@@ -564,4 +564,4 @@ def test_candidate_detail_fraction_schema_still_works(monkeypatch):
     df = pd.DataFrame({"Al": [0.95], "Ga": [0.03], "Pt": [0.02],
                        "pred_propylene_yield": [0.42]})
     md = app.candidate_detail(df, 0)
-    assert "Composition" in md and "Al(sup)" in md
+    assert "Composition" in md and "Al 0.95" in md

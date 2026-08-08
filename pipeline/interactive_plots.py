@@ -1,4 +1,4 @@
-"""Interactive Plotly versions of the four report figures.
+"""Interactive Plotly versions of the report figures.
 
 Each function mirrors a matplotlib plot in `plots.py` but returns a
 `plotly.graph_objects.Figure` instead of saving a PNG, so the webui can render
@@ -10,6 +10,7 @@ Figure IDs used downstream:
     "feature_importance" — held-out permutation-importance bars per target
     "gp_vs_bnn"          — GP vs Bayesian-NN scatter
     "candidate_heatmap"  — top-candidate property heatmap
+    "composition"        — metal-phase atomic fractions (fraction schema only)
 """
 from __future__ import annotations
 
@@ -447,5 +448,58 @@ def make_candidate_heatmap_figure(enriched_candidates: list[dict]) -> go.Figure 
         xaxis=dict(tickangle=-35, side="bottom"),
         yaxis=dict(autorange="reversed"),
         margin=dict(l=10, r=10, t=70, b=120),
+    )
+    return fig
+
+
+def make_fraction_composition_figure(
+    enriched_candidates: list[dict],
+    element_cols: list[str],
+    support_cations: list[str],
+) -> go.Figure | None:
+    """Plotly twin of plots.make_fraction_composition_heatmap.
+
+    Column selection and the shared-scale decision live in
+    `plots.build_fraction_composition_matrix` so the saved PNG and the webui
+    widget always show the same elements.
+    """
+    from plots import build_fraction_composition_matrix
+
+    built = build_fraction_composition_matrix(
+        enriched_candidates, element_cols, support_cations,
+    )
+    if built is None:
+        return None
+    row_labels, col_labels, matrix = built
+    vmax = float(np.nanmax(matrix)) or 1.0
+
+    text = [[("" if matrix[i, j] <= 0 else f"{matrix[i, j]:.3g}")
+             for j in range(matrix.shape[1])]
+            for i in range(matrix.shape[0])]
+    hover = [[f"{row_labels[i]}<br>{col_labels[j]}<br>atomic fraction: "
+              f"{matrix[i, j]:.4f}"
+              for j in range(matrix.shape[1])]
+             for i in range(matrix.shape[0])]
+
+    fig = go.Figure(data=go.Heatmap(
+        z=matrix,
+        x=col_labels,
+        y=row_labels,
+        colorscale="Magma",
+        zmin=0.0, zmax=vmax,
+        text=text,
+        texttemplate="%{text}",
+        textfont=dict(size=11),
+        hovertext=hover,
+        hoverinfo="text",
+        colorbar=dict(title="atomic<br>fraction"),
+    ))
+    fig.update_layout(
+        title="Metal-phase atomic fractions (support excluded — see row label)",
+        template="plotly_white",
+        height=max(360, 55 * len(row_labels) + 200),
+        xaxis=dict(side="bottom"),
+        yaxis=dict(autorange="reversed"),
+        margin=dict(l=10, r=10, t=70, b=80),
     )
     return fig
