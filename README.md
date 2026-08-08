@@ -263,18 +263,12 @@ inverse_material_design/
 
 ## Known limitations
 
-- **Role-based BO returns far fewer candidates than `BO_BATCH_SIZE`, and
-  `BO_MAX_PER_FAMILY` cannot help.** Measured on `pdh_literature` with the
-  101,816-row library: acquisition yields **9 distinct catalysts**, one per
-  active metal, regardless of settings — 71 of 80 fetched rows are duplicates
-  with the cap off, 91 of 100 with it on, and both produce the identical batch.
-  Promoters, support and loadings have no influence on which rows survive,
-  which points at the featurizer rather than the optimizer: catalysts sharing
-  an `active_metal` appear to featurize near-identically, so the argmin in
-  `_recover_library_rows` collapses them onto one library row. Raising
-  `BO_UNIQUE_OVERSAMPLE` only buys more collisions. Atomic-fraction mode is
-  unaffected — its library does not collapse, and the family cap works there
-  as documented.
+- **The role-based surrogate has no predictive skill on `pdh_literature`
+  (n=85).** Honest 5-fold CV puts every model at or below zero — GP conversion
+  R² = −0.06, GP selectivity R² = −0.32 — i.e. worse than predicting the mean.
+  BO candidates from this dataset are exploration suggestions, not ranked
+  predictions. Use the ACS example (GP R² +0.54 / +0.33) for anything that
+  depends on the surrogate being right.
 - Atomic-fraction schema: web-UI Tab 5 (Explore) filters degrade to no-ops.
   The step-6 report reconstructs roles that the dataset does not label — the
   support is inferred from the dominant Al/Si/Zr cation, and every other
