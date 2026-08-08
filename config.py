@@ -262,11 +262,26 @@ BO_UNIQUE_OVERSAMPLE = 4
 # whose "family" already has this many entries in the batch. Family definition
 # is mode-dependent:
 #   • Atomic-fraction mode: dominant non-support element (fraction > 0.005).
-#   • Role-based mode: not yet implemented; the flag is ignored.
+#   • Role-based mode: the active_metal cell — the same idea, since that is the
+#     role a chemist names the catalyst by.
+# On training data dominated by one metal (pdh_literature is 88% Pt) the
+# role-based cap will surface metals the surrogate has no signal for. That is
+# deliberate — diversity for hedging, carrying honestly-large sigma — but it is
+# the wrong setting for benchmark runs, where BO should exploit unrestricted.
 # Rationale: with strong-signal Pareto axes, BO can over-concentrate a single
 # family (e.g. 15/20 Mg-based low-deactivation picks on ACS PDH at K=30). A
 # cap of 4 on q=20 lets a family lead but keeps 4-6 chemistries represented
 # for handoff to experiment.
+#
+# CAVEAT — the role-based cap currently has nothing to bite on. Measured
+# 2026-08-08 on pdh_literature with the 101,816-row library: acquisition
+# returns only NINE distinct catalysts, one per active metal, whether the cap
+# is on (q=100, 91 duplicates) or off (q=80, 71 duplicates) — byte-identical
+# batches, 0 over-cap drops. Every catalyst sharing an active_metal appears to
+# featurize near-identically, so `_recover_library_rows`' argmin collapses them
+# onto one row, and raising the over-fetch only buys more collisions. Until
+# that is fixed the role-based cap is inert; it works as documented in
+# atomic-fraction mode, where the library does not collapse.
 BO_MAX_PER_FAMILY = 4
 # Over-fetch multiplier when BO_MAX_PER_FAMILY is set. Must be large enough
 # that the acquisition-ranked pool still contains BO_BATCH_SIZE catalysts

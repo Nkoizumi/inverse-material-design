@@ -175,7 +175,14 @@ Everything is in `config.py`. Key knobs:
 - `BNN_PREDICT_SAMPLES` — posterior draws per BNN prediction (default 512).
   This is the noise floor of every BNN number in the report; see the comment
   in `config.py` for the measurement behind the default.
-- `BO_MAX_PER_FAMILY` — family-diversity cap for the BO batch (default 4 for fraction mode; disabled for role-based).
+- `BO_MAX_PER_FAMILY` — family-diversity cap for the BO batch (default 4).
+  Family is the dominant non-support element in atomic-fraction mode and the
+  `active_metal` cell in role-based mode. Turn it off (`None`) for benchmark
+  runs: on training data dominated by one metal it will propose metals the
+  surrogate cannot predict, which is useful for hedging an experimental batch
+  and misleading as a measure of the optimizer.
+  **In role-based mode the cap is currently inert** — see the known limitation
+  below.
 - `SURROGATE_KIND` — `gp` (default), `bnn`, or `both`.
 - `CV_FOLDS` — 5-fold CV for parity plots (0 to disable).
 - `REPORT_LLM_KEEP_ALIVE` — how long Ollama keeps the report model in VRAM
@@ -256,6 +263,18 @@ inverse_material_design/
 
 ## Known limitations
 
+- **Role-based BO returns far fewer candidates than `BO_BATCH_SIZE`, and
+  `BO_MAX_PER_FAMILY` cannot help.** Measured on `pdh_literature` with the
+  101,816-row library: acquisition yields **9 distinct catalysts**, one per
+  active metal, regardless of settings — 71 of 80 fetched rows are duplicates
+  with the cap off, 91 of 100 with it on, and both produce the identical batch.
+  Promoters, support and loadings have no influence on which rows survive,
+  which points at the featurizer rather than the optimizer: catalysts sharing
+  an `active_metal` appear to featurize near-identically, so the argmin in
+  `_recover_library_rows` collapses them onto one library row. Raising
+  `BO_UNIQUE_OVERSAMPLE` only buys more collisions. Atomic-fraction mode is
+  unaffected — its library does not collapse, and the family cap works there
+  as documented.
 - Atomic-fraction schema: web-UI Tab 5 (Explore) filters degrade to no-ops.
   The step-6 report reconstructs roles that the dataset does not label — the
   support is inferred from the dominant Al/Si/Zr cation, and every other
